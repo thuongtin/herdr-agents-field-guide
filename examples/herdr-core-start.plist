@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Starts herdr-core in the GUI login session right after login, before any ssh
+       client can start it inside an ssh session (no Keychain access there).
+       "hc server status" starts a core only when none is running.
+       Replace __HOME__ with your home folder (launchd does not expand ~ or $HOME),
+       save as ~/Library/LaunchAgents/local.herdr-core-start.plist and load it with:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.herdr-core-start.plist -->
+  <key>Label</key>
+  <string>local.herdr-core-start</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/hc</string>
+    <string>server</string>
+    <string>status</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/herdr-core/login-start.log</string>
+</dict>
+</plist>

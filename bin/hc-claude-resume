@@ -1,0 +1,838 @@
+#!/usr/bin/env python3
+"""Bring coding agents (Claude Code, Codex, Grok) back into herdr-core terminals after
+a reboot or core restart.
+
+herdr-core keeps terminals across a loss (reboot, logout, core crash) but only gives
+them a fresh shell: the original command (claude-work, codex, grok, ...) is never run
+again, so the tab keeps its "Claude (work)" or "Codex" name while running a plain shell,
+and a manual `claude -c` there signs in with the default account.
+
+  hc-claude-resume hook [agent]
+                          Agent hook (SessionStart, UserPromptSubmit, SessionEnd). Records,
+                          per herdr-core terminal, the agent, session id, folder and, for
+                          Claude, the account (CLAUDE_ACCOUNT_LABEL from the claude-<name>
+                          launchers). Claude and Grok run it from ~/.claude/settings.json
+                          (Grok reads that file too); Codex from ~/.codex/hooks.json with
+                          the explicit agent name.
+  hc-claude-resume check  Run by ~/.zshrc at the first prompt of a shell. Prints the
+                          command that resumes the recorded session, only when the
+                          terminal's program was replaced since the session was recorded
+                          (= the terminal was lost).
+  hc-claude-resume seed   Record the Claude sessions that are running right now (for
+                          sessions started before the hook was installed).
+  hc-claude-resume set <terminal> <agent> <session-id> [folder]
+                          Record a session by hand for a terminal that already lost its
+                          agent; the next shell started in that terminal resumes it.
+  hc-claude-resume list   Show what is recorded.
+
+After a reboot all terminals reach their first prompt together. Claude Code asks the
+terminal `OSC 7501 ; ?` once at startup and gives the answer 2 s, counted while its own
+startup work runs. On a loaded machine (many agents starting) it handles the core's
+answer (which arrives within ~0.1 s) after that deadline, settles "no program status"
+for the whole session, never reports status to herdr-core and is missing from the
+Herdr app's Agents list. It never asks again. Measured 2026-11-18 with 12 resumes after
+a simulated reboot: 2 of 12 missed it with starts 2 s apart.
+So `check` lets one agent start at a time: the next start waits until the previous
+agent reports its status to the core (START_SETTLE_MAX_S at most). `status-check`
+then watches each resumed Claude; one that sits at its idle prompt without a status
+is restarted once the machine is quiet (the terminal's program is killed, the core
+gives a shell, `check` resumes again), STATUS_RETRY_MAX times at most. Taking turns
+alone is not enough: contention comes in bursts from the sessions already started
+(each indexes its folder and starts its MCP servers), measured up to 4 of 13 starts
+missed. An empty file "no-status-retry" in the state folder turns the restart off
+(the result is still logged).
+
+State: ~/.local/state/hc-claude-resume/<core>/<terminal>.json (no tokens stored).
+Debug: create an empty file named "debug" in that folder to log every hook call.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+STATE_ROOT = os.path.expanduser("~/.local/state/hc-claude-resume")
+MAX_AGE_S = 30 * 24 * 3600
+AGENTS = ("claude", "codex", "grok")
+# SessionEnd reasons that mean the user ended the session on purpose. "other" is left
+# out: that is what a killed Claude (shutdown, closed pty) reports, if it reports at all.
+DELIBERATE_END = {"clear", "resume", "logout", "prompt_input_exit", "bypass_permissions_disabled"}
+# Boolean flags carried over to the resume command. Never flags that take a value.
+RESUME_FLAGS = {
+    "claude": ("--dangerously-skip-permissions",),
+    # --no-daemon matters for this tool: with Codex's shared background server the hooks
+    # run inside that server, with the environment of whichever terminal started it
+    # first, so a session cannot be tied to its terminal and is never recorded. The
+    # Herdr app's own Codex entry starts `codex --no-daemon`; a resume must keep that.
+    "codex": ("--dangerously-bypass-approvals-and-sandbox", "--search", "--no-daemon"),
+    "grok": ("--always-approve",),
+}
+# First argument words that mean a one-shot or helper run, not a session to bring back.
+CODEX_HEADLESS = {
+    "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server", "remote-control",
+    "app", "completion", "update", "doctor", "sandbox", "debug", "apply", "a", "queue",
+    "archive", "delete", "unarchive", "migrate-rollouts", "migrate-nfs-db", "cloud",
+}
+GROK_HEADLESS = {"-p", "--single", "--prompt-file", "--prompt-json"}
+# Codex has no SessionEnd hook and Grok's end reasons are not documented, so an agent
+# that was quit in place is noticed by the shell that takes over the terminal. The
+# record is dropped only after this delay: at shutdown the agent can die a moment
+# before its shell does, and that must not look like the user quitting.
+REAP_DELAY_S = 25
+# Agent starts of one core take turns. Least seconds between two starts, longest wait
+# for the previous agent to report its status, and longest a start is held in total.
+START_GAP_S = 2.0
+START_SETTLE_MAX_S = 20
+START_WAIT_MAX_S = 300
+# Watching a resumed agent: first look, interval, and when to stop looking.
+STATUS_CHECK_FIRST_S = 15
+STATUS_CHECK_EVERY_S = 5
+STATUS_CHECK_MAX_S = 240
+# A Claude at its idle prompt for this long without a status has missed its probe.
+STATUS_IDLE_CONFIRM_S = 12
+# Restarts of one terminal's Claude for a missed probe (forgotten after an hour).
+STATUS_RETRY_MAX = 2
+STATUS_RETRY_MEMORY_S = 3600
+# A restart waits for a quiet machine, or it misses again: no agent start for this
+# long, and a short busy loop gets a core nearly to itself (wall time / CPU time),
+# on this many looks in a row. After RESTART_WAIT_MAX_S it goes ahead anyway.
+RESTART_QUIET_S = 30
+RESTART_CONTENTION_MAX = 1.5
+RESTART_QUIET_LOOKS = 3
+RESTART_WAIT_MAX_S = 600
+LABEL_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+
+
+def hc_bin():
+    return shutil.which("hc") or os.path.expanduser("~/.local/bin/hc")
+
+
+def state_dir():
+    sock = os.environ.get("HC_TERMINAL_SOCKET", "")
+    core = os.path.basename(os.path.dirname(sock)) if sock else "default"
+    return os.path.join(STATE_ROOT, core or "default")
+
+
+def entry_path(terminal):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", terminal)
+    return os.path.join(state_dir(), safe + ".json")
+
+
+def hc_terminal(terminal):
+    try:
+        out = subprocess.run(
+            [hc_bin(), "get", terminal, "--json"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        data = json.loads(out)
+    except Exception:
+        return None
+    return data.get("terminal", data) if isinstance(data, dict) else None
+
+
+def proc_info(pid):
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        ppid, comm = out.split(None, 1)
+        return int(ppid), comm
+    except Exception:
+        return None
+
+
+def proc_argv(pid):
+    try:
+        out = subprocess.run(
+            ["ps", "-ww", "-o", "args=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=3,
+        ).stdout.strip()
+        return out.split()
+    except Exception:
+        return []
+
+
+def agent_of(comm):
+    name = os.path.basename(comm)
+    return name if name in AGENTS else None
+
+
+def nearest_agent_ancestor(want=None):
+    """(pid, agent) of the agent process that runs this hook."""
+    pid = os.getppid()
+    for _ in range(12):
+        info = proc_info(pid)
+        if not info:
+            return None, None
+        ppid, comm = info
+        agent = agent_of(comm)
+        if agent and (want is None or agent == want):
+            return pid, agent
+        if ppid <= 1:
+            return None, None
+        pid = ppid
+    return None, None
+
+
+def is_terminal_top_agent(agent_pid, program_pid):
+    """True when no other agent sits between agent_pid and the terminal's program.
+
+    A `claude -p` or `codex exec` started from inside the terminal's agent inherits
+    HC_TERMINAL_ID too; it must not replace the record. Walking the parents (instead of
+    comparing with the terminal's foreground) also works when a wrapper such as the
+    smart-suggestion proxy is the foreground program.
+    """
+    info = proc_info(agent_pid)
+    pid = info[0] if info else 0
+    for _ in range(16):
+        if pid == program_pid:
+            return True
+        if pid <= 1:
+            return False
+        info = proc_info(pid)
+        if not info:
+            return False
+        if agent_of(info[1]):
+            return False
+        pid = info[0]
+    return False
+
+
+def is_headless(agent, argv):
+    args = argv[1:]
+    if agent == "codex":
+        return bool(args) and args[0] in CODEX_HEADLESS
+    if agent == "grok":
+        return any(a in GROK_HEADLESS for a in args)
+    return False
+
+
+def claude_session_file(pid):
+    """Claude Code's own registry of running sessions: ~/.claude/sessions/<pid>.json."""
+    return read_json(os.path.expanduser(f"~/.claude/sessions/{pid}.json")) or {}
+
+
+def log_event(text):
+    try:
+        path = os.path.join(state_dir(), "events.log")
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > 200_000:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+    except Exception:
+        pass
+
+
+def debug_on():
+    return os.path.exists(os.path.join(state_dir(), "debug"))
+
+
+def ancestry():
+    """Parent chain of this process as "pid:name > pid:name" (debug log only)."""
+    parts, pid = [], os.getppid()
+    for _ in range(12):
+        info = proc_info(pid)
+        if not info:
+            break
+        parts.append(f"{pid}:{os.path.basename(info[1])}")
+        if info[0] <= 1:
+            break
+        pid = info[0]
+    return " > ".join(parts)
+
+
+def boot_time():
+    try:
+        out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True, timeout=3).stdout
+        return int(re.search(r"sec = (\d+)", out).group(1))
+    except Exception:
+        return 0
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1)
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+def prune():
+    d = state_dir()
+    now = time.time()
+    try:
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            if not name.endswith(".json"):
+                continue
+            if now - os.path.getmtime(p) > MAX_AGE_S:
+                os.remove(p)
+    except Exception:
+        pass
+
+
+def entry_agent(entry):
+    agent = entry.get("agent") or "claude"
+    return agent if agent in AGENTS else None
+
+
+def entry_agent_pid(entry):
+    return entry.get("agent_pid") or entry.get("claude_pid") or 0
+
+
+def same_session_records(terminal, agent, session_id):
+    """(path, record) of the other terminals of this core that hold the same session."""
+    found = []
+    d = state_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return found
+    own = os.path.basename(entry_path(terminal))
+    for name in names:
+        if not name.endswith(".json") or name == own:
+            continue
+        other = read_json(os.path.join(d, name))
+        if isinstance(other, dict) and other.get("session_id") == session_id and entry_agent(other) == agent:
+            found.append((os.path.join(d, name), other))
+    return found
+
+
+def record_is_live(entry):
+    """The agent of this record is running now (same boot, same kind of process)."""
+    agent = entry_agent(entry)
+    return bool(agent) and entry.get("recorded_at", 0) >= boot_time() and pid_runs(entry_agent_pid(entry), agent)
+
+
+def record(terminal, agent, session_id, agent_pid, cwd, label, source):
+    term = hc_terminal(terminal)
+    if not term or not term.get("pid"):
+        return False
+    if not is_terminal_top_agent(agent_pid, term["pid"]):
+        return False
+    argv = proc_argv(agent_pid)
+    if agent == "claude":
+        if claude_session_file(agent_pid).get("kind", "interactive") != "interactive":
+            return False
+    elif is_headless(agent, argv):
+        return False
+    if agent != "claude" or (label and not LABEL_RE.match(label)):
+        label = ""
+    write_json(entry_path(terminal), {
+        "terminal": terminal,
+        "agent": agent,
+        "session_id": session_id,
+        "cwd": cwd,
+        "account": label,
+        "flags": [f for f in RESUME_FLAGS[agent] if f in argv],
+        "agent_pid": agent_pid,
+        "program_pid": term["pid"],
+        "recorded_at": int(time.time()),
+        "source": source,
+    })
+    # A session lives in one terminal. A record left by an agent that died in place
+    # (kill, crash: SessionEnd reason "other" keeps it) would bring the same session
+    # back in two tabs after the next reboot once the user continued it elsewhere.
+    for path, other in same_session_records(terminal, agent, session_id):
+        if not record_is_live(other):
+            remove(path)
+            log_event(f"{other.get('terminal')} removed session={session_id} agent={agent}: "
+                      f"the session is now in {terminal}")
+    return True
+
+
+def cmd_hook(want):
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    event = re.sub(r"[^a-z]", "", str(payload.get("hook_event_name") or "").lower())
+    session_id = str(payload.get("session_id") or os.environ.get("GROK_SESSION_ID") or "")
+    if debug_on():
+        log_event(f"debug hook want={want} terminal={terminal} event={event} session={session_id} "
+                  f"source={payload.get('source')} reason={payload.get('reason')} "
+                  f"keys={','.join(sorted(payload))} "
+                  f"grok_env={bool(os.environ.get('GROK_SESSION_ID'))} "
+                  f"codex_thread={os.environ.get('CODEX_THREAD_ID', '')} chain={ancestry()}")
+    if not terminal or payload.get("agent_id"):
+        return 0
+    path = entry_path(terminal)
+    old = read_json(path) or {}
+
+    if event == "sessionend":
+        # Only Claude's end reasons are known; Codex and Grok records are dropped by
+        # `check` when the agent is gone and its shell took over (see REAP_DELAY_S).
+        if entry_agent(old) != "claude" or want not in (None, "claude"):
+            return 0
+        reason = payload.get("reason")
+        mine = old.get("session_id") == session_id
+        deliberate = reason in DELIBERATE_END
+        if mine and deliberate:
+            remove(path)
+        log_event(f"{terminal} SessionEnd reason={reason} session={session_id} recorded={mine} removed={mine and deliberate}")
+        return 0
+    if event not in ("sessionstart", "userpromptsubmit") or not SESSION_RE.match(session_id):
+        return 0
+
+    agent_pid, agent = nearest_agent_ancestor(want)
+    if not agent_pid:
+        return 0
+    # A Codex session started by another Codex session (subagent, review) inherits the
+    # parent's thread id; only the top session is worth bringing back.
+    inherited = os.environ.get("CODEX_THREAD_ID")
+    if agent == "codex" and inherited and inherited != session_id:
+        return 0
+    # UserPromptSubmit runs on every prompt: it only fills in what SessionStart missed
+    # (hooks do not run before the folder-trust dialog; sessions older than this hook).
+    if event == "userpromptsubmit" and old.get("session_id") == session_id and entry_agent_pid(old) == agent_pid:
+        return 0
+    source = payload.get("source") or payload.get("hook_event_name") or event
+    label = os.environ.get("CLAUDE_ACCOUNT_LABEL", "") if agent == "claude" else ""
+    if record(terminal, agent, session_id, agent_pid, payload.get("cwd") or os.getcwd(), label, source):
+        who = f"account={label or 'default'}" if agent == "claude" else f"agent={agent}"
+        log_event(f"{terminal} recorded session={session_id} {who} via={source}")
+        prune()
+    return 0
+
+
+def proc_env_value(pid, name):
+    """One variable from a process's start environment (never returned in bulk)."""
+    try:
+        out = subprocess.run(["ps", "eww", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return ""
+    m = re.search(r"(?:^|\s)" + re.escape(name) + r"=(\S*)", out)
+    return m.group(1) if m else ""
+
+
+def cmd_seed():
+    sessions = os.path.expanduser("~/.claude/sessions")
+    try:
+        names = [n for n in os.listdir(sessions) if re.fullmatch(r"\d+\.json", n)]
+    except FileNotFoundError:
+        names = []
+    for name in sorted(names):
+        pid = int(name[:-5])
+        info = proc_info(pid)
+        meta = claude_session_file(pid)
+        if not info or agent_of(info[1]) != "claude" or meta.get("kind") != "interactive":
+            continue
+        terminal = proc_env_value(pid, "HC_TERMINAL_ID")
+        sock = proc_env_value(pid, "HC_TERMINAL_SOCKET")
+        session_id = str(meta.get("sessionId") or "")
+        if not terminal or not SESSION_RE.match(session_id):
+            continue
+        if sock:
+            os.environ["HC_TERMINAL_SOCKET"] = sock
+        label = proc_env_value(pid, "CLAUDE_ACCOUNT_LABEL")
+        ok = record(terminal, "claude", session_id, pid, meta.get("cwd") or "", label, "seed")
+        print(f"{terminal:6} {label or 'default':8} {session_id}  {'recorded' if ok else 'skipped'}")
+        if ok:
+            log_event(f"{terminal} recorded session={session_id} account={label or 'default'} via=seed")
+    return 0
+
+
+def cmd_set(args):
+    if len(args) < 3 or args[1] not in AGENTS or not SESSION_RE.match(args[2]):
+        print("usage: hc-claude-resume set <terminal> <claude|codex|grok> <session-id> [folder]", file=sys.stderr)
+        return 2
+    terminal, agent, session_id = args[:3]
+    cwd = args[3] if len(args) > 3 else ""
+    term = hc_terminal(terminal)
+    if not term or not term.get("pid"):
+        print(f"{terminal}: no such live terminal", file=sys.stderr)
+        return 1
+    fg = term.get("foreground") or {}
+    if agent_of((fg.get("argv") or [""])[0]):
+        print(f"{terminal}: an agent is running there; its hook records it", file=sys.stderr)
+        return 1
+    # program_pid 0 never matches a real program, so the next shell that starts in
+    # this terminal (new shell, core restart, reboot) resumes the session.
+    write_json(entry_path(terminal), {
+        "terminal": terminal,
+        "agent": agent,
+        "session_id": session_id,
+        "cwd": cwd or fg.get("cwd") or "",
+        "account": "",
+        "flags": [],
+        "agent_pid": 0,
+        "program_pid": 0,
+        "recorded_at": int(time.time()),
+        "source": "set",
+    })
+    log_event(f"{terminal} recorded session={session_id} agent={agent} via=set")
+    return 0
+
+
+def resume_command(entry):
+    agent = entry_agent(entry)
+    if not agent:
+        return None
+    session_id = entry["session_id"]
+    flags = [f for f in (entry.get("flags") or []) if f in RESUME_FLAGS[agent]]
+    if agent == "claude":
+        label = entry.get("account") or ""
+        launcher = f"claude-{label}" if label else "claude"
+        if label and not shutil.which(launcher):
+            return None  # never fall back to another account silently
+        if entry.get("skip_permissions") and not flags:  # records written before "flags"
+            flags = ["--dangerously-skip-permissions"]
+        if label:
+            flags = []  # the launcher adds its own
+        parts = [launcher] + flags + ["--resume", session_id]
+    elif agent == "codex":
+        parts = ["codex", "resume"] + flags + [session_id]
+    else:
+        parts = ["grok"] + flags + ["--resume", session_id]
+    if not shutil.which(parts[0]):
+        return None
+    cwd = entry.get("cwd")
+    cmd = " ".join(shlex.quote(p) for p in parts)
+    if cwd and os.path.isdir(cwd):
+        cmd = f"cd -- {shlex.quote(cwd)} && {cmd}"
+    return cmd
+
+
+def pid_runs(pid, agent):
+    info = proc_info(pid) if pid else None
+    return bool(info) and agent_of(info[1]) == agent
+
+
+def start_reap(terminal, entry):
+    """Check again later whether the agent of this record was quit in place."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "reap", terminal, str(entry_agent_pid(entry))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def cmd_reap(args):
+    if len(args) < 2 or not args[1].isdigit():
+        return 2
+    terminal, agent_pid = args[0], int(args[1])
+    time.sleep(REAP_DELAY_S)
+    path = entry_path(terminal)
+    entry = read_json(path)
+    if not entry or not agent_pid or entry_agent_pid(entry) != agent_pid:
+        return 0  # replaced or removed meanwhile
+    agent = entry_agent(entry)
+    if not agent or pid_runs(agent_pid, agent):
+        return 0
+    term = hc_terminal(terminal)
+    if not term or term.get("pid") != entry.get("program_pid"):
+        return 0  # the terminal was lost: `check` in its new shell decides
+    if entry.get("recorded_at", 0) < boot_time():
+        return 0
+    remove(path)
+    log_event(f"{terminal} removed session={entry.get('session_id')} agent={agent}: quit in place")
+    return 0
+
+
+def terminal_status(term):
+    status = (term or {}).get("status") or {}
+    return status.get("state") if isinstance(status, dict) else None
+
+
+def previous_start_settled(prev, now):
+    """True when the start before this one no longer needs the machine to itself."""
+    since = now - float(prev.get("at") or 0)
+    if since < START_GAP_S:
+        return False
+    if since >= START_SETTLE_MAX_S:
+        return True
+    term = hc_terminal(str(prev.get("terminal") or ""))
+    return not term or bool(terminal_status(term))
+
+
+def wait_for_start_slot(terminal, agent):
+    """Hold this start until its turn: one agent start at a time per core.
+
+    The lock is held while waiting for the previous start to settle, so the others
+    queue behind it. Returns the seconds waited. Any failure means no wait: a missed
+    status probe (repaired by `status-check`) is better than a session not resumed.
+    """
+    began = time.time()
+    try:
+        import fcntl
+        path = os.path.join(state_dir(), "start-slot")
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.time() - began > START_WAIT_MAX_S:
+                        return time.time() - began  # queue too long: start anyway
+                    time.sleep(0.2)
+            try:
+                prev = json.loads(os.read(fd, 1024).decode() or "{}")
+                if not isinstance(prev, dict):
+                    prev = {}
+            except ValueError:
+                prev = {}
+            if float(prev.get("at") or 0) > time.time():
+                prev = {}  # clock went back, or a broken value
+            while time.time() - began < START_WAIT_MAX_S:
+                if not prev or previous_start_settled(prev, time.time()):
+                    break
+                time.sleep(0.5)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps({"terminal": terminal, "agent": agent, "at": time.time()}).encode())
+        finally:
+            os.close(fd)  # also releases the lock
+        return time.time() - began
+    except Exception:
+        return 0.0
+
+
+def start_status_check(terminal, program_pid):
+    """Watch the resumed agent: does it report its status to the core."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "status-check", terminal, str(program_pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def screen_text(terminal):
+    try:
+        return subprocess.run([hc_bin(), "read", terminal, "--lines", "0"],
+                              capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+def claude_idle_prompt(text):
+    """True when the screen shows Claude's empty input box and nothing running."""
+    if "esc to interrupt" in text:
+        return False
+    lines = [ln.replace("\u00a0", " ").strip() for ln in text.splitlines()]
+    return any(ln == "\u276f" for ln in lines[-12:])
+
+
+def retries_path(terminal):
+    return entry_path(terminal)[:-len(".json")] + ".retries"
+
+
+def retries_done(terminal):
+    try:
+        with open(retries_path(terminal), encoding="utf-8") as fh:
+            count, at = fh.read().split()
+        return int(count) if time.time() - float(at) < STATUS_RETRY_MEMORY_S else 0
+    except Exception:
+        return 0
+
+
+def cpu_contention(cpu_s=0.05):
+    """Wall time over CPU time of a short busy loop: 1.0 with a free core, more when
+    programs queue for the CPU (what makes Claude miss its probe deadline)."""
+    t0, c0 = time.perf_counter(), time.process_time()
+    while time.process_time() - c0 < cpu_s:
+        pass
+    return (time.perf_counter() - t0) / max(time.process_time() - c0, 1e-3)
+
+
+def machine_quiet():
+    try:
+        with open(os.path.join(state_dir(), "start-slot"), encoding="utf-8") as fh:
+            last = float((json.load(fh) or {}).get("at") or 0)
+    except Exception:
+        last = 0.0
+    return time.time() - last >= RESTART_QUIET_S and cpu_contention() < RESTART_CONTENTION_MAX
+
+
+def cmd_status_check(args):
+    if len(args) < 2 or not args[1].isdigit():
+        return 2
+    terminal, program_pid = args[0], int(args[1])
+    began = time.time()
+    idle_since = missed_at = None
+    quiet_looks = 0
+    time.sleep(STATUS_CHECK_FIRST_S)
+    while True:
+        term = hc_terminal(terminal)
+        if not term or term.get("pid") != program_pid:
+            return 0  # the terminal was lost or replaced again
+        fg = term.get("foreground") or {}
+        agent = agent_of((fg.get("argv") or [""])[0])
+        state = terminal_status(term)
+        now = time.time()
+        waited = int(now - began)
+        if agent and state:
+            remove(retries_path(terminal))
+            log_event(f"{terminal} status check: agent={agent} reports {state} after {waited}s")
+            return 0
+        if agent == "claude" and claude_idle_prompt(screen_text(terminal)):
+            idle_since = idle_since or now
+        else:
+            idle_since = None  # busy, a dialog, or the user is typing: hands off
+            quiet_looks = 0
+        # Up and idle for a while, and still no status: the probe was missed.
+        if idle_since and now - idle_since >= STATUS_IDLE_CONFIRM_S:
+            if missed_at is None:
+                missed_at = now
+                done = retries_done(terminal)
+                what = (f"{terminal} status check: agent=claude reports NO status after {waited}s "
+                        f"(missed its OSC 7501 probe)")
+                if os.path.exists(os.path.join(state_dir(), "no-status-retry")):
+                    log_event(f"{what}; restart is turned off")
+                    return 0
+                if done >= STATUS_RETRY_MAX:
+                    log_event(f"{what}, {done} restarts done; giving up (restart the tab's program by hand)")
+                    return 0
+                log_event(f"{what}; restart try {done + 1} of {STATUS_RETRY_MAX} once the machine is quiet")
+            quiet_looks = quiet_looks + 1 if machine_quiet() else 0
+            if quiet_looks >= RESTART_QUIET_LOOKS or now - missed_at >= RESTART_WAIT_MAX_S:
+                try:
+                    done = retries_done(terminal)  # read before the file is opened for writing
+                    with open(retries_path(terminal), "w", encoding="utf-8") as fh:
+                        fh.write(f"{done + 1} {time.time()}")
+                    log_event(f"{terminal} status check: restarting the agent after {waited}s")
+                    os.kill(program_pid, 9)
+                except Exception as exc:
+                    log_event(f"{terminal} status check: restart failed: {exc}")
+                return 0
+        limit = STATUS_CHECK_MAX_S + (RESTART_WAIT_MAX_S if missed_at else 0)
+        if now - began >= limit:
+            what = f"agent={agent} reports NO status" if agent else "no agent in the foreground"
+            log_event(f"{terminal} status check: {what} after {waited}s; left alone "
+                      f"(not at an idle Claude prompt)")
+            return 0
+        time.sleep(3 if missed_at else STATUS_CHECK_EVERY_S)
+
+
+def cmd_check():
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    if not terminal:
+        return 1
+    path = entry_path(terminal)
+    entry = read_json(path)
+    if not entry or not SESSION_RE.match(str(entry.get("session_id", ""))):
+        return 1
+    agent = entry_agent(entry)
+    term = hc_terminal(terminal)
+    if not term or not agent:
+        return 1
+    program_pid = term.get("pid")
+    if entry.get("consumed_by") == program_pid:
+        return 1  # already resumed (or tried) for this program
+    lost = program_pid != entry.get("program_pid") or entry.get("recorded_at", 0) < boot_time()
+    if not lost:
+        # Same program: the agent exited or crashed in place, not a loss. Claude's
+        # SessionEnd hook already dropped the record if the user quit on purpose.
+        if agent != "claude" and not pid_runs(entry_agent_pid(entry), agent):
+            start_reap(terminal, entry)
+        return 1
+    fg = term.get("foreground") or {}
+    if agent_of((fg.get("argv") or [""])[0]):
+        return 1
+    # The same session recorded for two terminals: only one may bring it back. The
+    # other terminal wins when its agent runs now or its record is the later one.
+    mine = (entry.get("recorded_at", 0), terminal)
+    for _, other in same_session_records(terminal, agent, entry["session_id"]):
+        other_terminal = str(other.get("terminal") or "")
+        live = record_is_live(other)
+        later = (other.get("recorded_at", 0), other_terminal) > mine
+        if live or (later and (hc_terminal(other_terminal) or {}).get("pid")):
+            remove(path)
+            log_event(f"{terminal} not resumed: session={entry['session_id']} agent={agent} "
+                      f"{'runs in' if live else 'has a later record for'} {other_terminal}; record removed")
+            return 1
+    cmd = resume_command(entry)
+    if not cmd:
+        return 1
+    waited = wait_for_start_slot(terminal, agent)
+    entry["consumed_by"] = program_pid
+    write_json(path, entry)
+    if waited >= 0.5:
+        log_event(f"{terminal} start held {waited:.1f}s for its turn")
+    start_status_check(terminal, program_pid)
+    print(cmd)
+    return 0
+
+
+def cmd_list():
+    d = state_dir()
+    try:
+        names = sorted(os.listdir(d))
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        e = read_json(os.path.join(d, name)) or {}
+        when = time.strftime("%m-%d %H:%M", time.localtime(e.get("recorded_at", 0)))
+        who = e.get("agent") or "claude"
+        if who == "claude":
+            who = f"claude:{e.get('account') or 'default'}"
+        print(f"{e.get('terminal','?'):6} {who:15} {when}  {e.get('session_id')}  {e.get('cwd')}")
+    return 0
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "hook":
+        want = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] in AGENTS else None
+        try:
+            return cmd_hook(want)
+        except Exception:
+            return 0  # a hook must never get in the agent's way
+    if cmd == "check":
+        return cmd_check()
+    if cmd == "reap":
+        try:
+            return cmd_reap(sys.argv[2:])
+        except Exception:
+            return 0
+    if cmd == "status-check":
+        try:
+            return cmd_status_check(sys.argv[2:])
+        except Exception:
+            return 0
+    if cmd == "seed":
+        return cmd_seed()
+    if cmd == "set":
+        return cmd_set(sys.argv[2:])
+    if cmd == "list":
+        return cmd_list()
+    print(__doc__.strip(), file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
