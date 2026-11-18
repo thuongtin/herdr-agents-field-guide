@@ -16,6 +16,22 @@ The repository holds **documentation, one small tool (`hc-claude-resume`) and sc
 | Second | Claude Code came back on the right accounts. Codex and Grok did not. Some tabs said "Not logged in" | The core had been started from an ssh connection and could not read the Keychain |
 | Third | Every agent came back, but 9 of 14 Claude Code tabs were missing from the Agents list | Claude Code asks the terminal once at startup and waits about 2 seconds. With about 30 agents starting together it read the answer too late, and it never asks again |
 
+The path of one tab after a reboot, with the tool of this repository:
+
+```mermaid
+flowchart TD
+    A["Reboot, logout or core crash"] --> B["herdr-core recovers each terminal<br/>as a bare shell"]
+    B --> C{"Record for this tab?"}
+    C -- "no" --> S["Tab stays a shell"]
+    C -- "yes" --> D["Agent starts take turns"]
+    D --> E["Same session, same account"]
+    E --> F{"Does the agent report a status?"}
+    F -- "yes" --> G["Listed under Agents"]
+    F -- "no, startup probe missed" --> H["Agent restarted when the machine is quiet"]
+    H -- "2 times at most" --> F
+    H -- "still missing" --> I["Give up and log it"]
+```
+
 ## Main lessons
 
 1. **herdr-core keeps terminals, not agents.** After a loss (reboot, logout, core crash) a tab comes back as a bare shell. To get the agent back you have to record which session ran in which tab, and on which account. See [Resume after a reboot](docs/resume-after-reboot.md).
@@ -26,13 +42,29 @@ The repository holds **documentation, one small tool (`hc-claude-resume`) and sc
 6. **Every tab inherits where the core was born.** Born in an ssh session: no Keychain. Born in an agent's session: every tab is treated as a child session and saves no transcript. See [Core environment](docs/core-environment.md).
 7. **Codex in its shared background server cannot be tied to a tab.** `codex --no-daemon` can. New Codex hooks need your own review. See [Codex and Grok](docs/codex-and-grok.md).
 8. **Reproduce before you conclude.** Every experiment ran in a separate core (`HC_SESSION=<name>`) with copies of sessions, never in the real tabs. See [Reproduce](docs/reproduce.md).
+9. **One Claude account per tab means every command goes through that account's launcher.** Transcripts are shared, so any account can continue any session and nothing warns you. The `claude --resume <id>` line that Claude Code prints at exit moves the session to the default account. See [One account per tab](docs/claude-accounts.md).
 
 ## Contents
+
+Every page has mermaid diagrams. Which page for which symptom:
+
+```mermaid
+flowchart LR
+    Q{"What do you see?"}
+    Q -- "tabs are plain shells" --> R["resume-after-reboot"]
+    Q -- "agent runs but is not in the list" --> M["missing-agents-root-cause"]
+    Q -- "Not logged in, or no transcript saved" --> C["core-environment"]
+    Q -- "a tab on the wrong account" --> A["claude-accounts"]
+    Q -- "Codex or Grok did not come back" --> X["codex-and-grok"]
+    Q -- "no agent detected, menu entry opens a shell" --> P["shell-pitfalls"]
+    Q -- "something else" --> T["troubleshooting"]
+```
 
 | Path | What it is |
 |---|---|
 | [docs/missing-agents-root-cause.md](docs/missing-agents-root-cause.md) | Symptom, evidence, what did not work, what is done now |
 | [docs/resume-after-reboot.md](docs/resume-after-reboot.md) | How sessions are recorded and resumed, install steps, knobs |
+| [docs/claude-accounts.md](docs/claude-accounts.md) | One Claude Code account per tab: long-lived tokens, a settings file and a launcher per account, how to tell which account a tab is on, the wrong-account trap |
 | [docs/codex-and-grok.md](docs/codex-and-grok.md) | How Codex and Grok differ, bringing back a tab that was already lost |
 | [docs/core-environment.md](docs/core-environment.md) | A core born in ssh, a core born in an agent's session, repair without losing tabs |
 | [docs/shell-pitfalls.md](docs/shell-pitfalls.md) | Shell-wrapping plugins, instant prompt, sending text between terminals, the wrong-account trap |
@@ -43,7 +75,7 @@ The repository holds **documentation, one small tool (`hc-claude-resume`) and sc
 | [docs/privacy.md](docs/privacy.md) | What is published, what was left out, what the tool stores on your machine |
 | [bin/hc-claude-resume](bin/hc-claude-resume) | The record and resume tool (Python, one file, standard library only) |
 | [shell/](shell) | Snippets for `~/.zshrc` and `~/.zshenv` |
-| [examples/](examples) | Hook examples for Claude Code and Codex, an account launcher, a LaunchAgent |
+| [examples/](examples) | Hook examples for Claude Code and Codex, an account launcher and its settings file (placeholder only, no token), a LaunchAgent |
 | [tools/](tools) | Simulated reboot, functional test, CPU contention and terminal reply timing |
 | [tests/](tests) | Tests of the tool's logic and of the documentation (run in CI, no `hc` needed) |
 

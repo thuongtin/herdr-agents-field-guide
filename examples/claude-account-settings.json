@@ -1,0 +1,5 @@
+{
+  "env": {
+    "CLAUDE_CODE_OAUTH_TOKEN": "<paste the token of this account here, then chmod 600 this file>"
+  }
+}

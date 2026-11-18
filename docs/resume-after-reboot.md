@@ -12,8 +12,18 @@ The tab is still called "Claude (work)" or "Codex", so the natural move is to ty
 
 ## How it works
 
-```
-agent hook  ->  record per terminal  ->  shell's first prompt runs `check`  ->  resume command
+```mermaid
+flowchart LR
+    subgraph before["While the agent runs"]
+        H["Agent hook<br/>session start, each prompt"] --> R["Record per terminal<br/>agent, session, folder, account label"]
+    end
+    subgraph after["After the terminal was lost"]
+        S["Recovered shell<br/>first prompt"] --> K["check"]
+        K --> Q["Start queue"]
+        Q --> C["Resume command typed into the shell"]
+        C --> W["Watcher follows the tab"]
+    end
+    R -. "read by" .-> K
 ```
 
 1. **Record.** A hook of the agent writes one small JSON file per terminal: agent, session id, folder, account label, the agent's pid and the pid of the terminal's program. No tokens are stored.
@@ -21,6 +31,26 @@ agent hook  ->  record per terminal  ->  shell's first prompt runs `check`  ->  
 3. **Resume.** `check` prints one command line and the shell runs it: `cd <folder> && claude-<label> --resume <id>`, `codex resume [flags] <id>` or `grok [flags] --resume <id>`.
 
 Things that deliberately do not resume: quitting the agent in place, a crash in place, a subshell, a second shell in the same terminal. In those cases the terminal's program is still the same one.
+
+What `check` decides at the first prompt of a shell:
+
+```mermaid
+flowchart TD
+    A["Shell shows its first prompt"] --> B{"Record for this terminal?"}
+    B -- "no" --> Z["Nothing happens"]
+    B -- "yes" --> C{"Already resumed for this terminal program?"}
+    C -- "yes" --> Z
+    C -- "no" --> D{"Terminal program changed,<br/>or record older than the last boot?"}
+    D -- "no" --> E["Agent ended in place: no resume<br/>Codex and Grok records are removed 25 s later"]
+    D -- "yes" --> F{"An agent already in the foreground?"}
+    F -- "yes" --> Z
+    F -- "no" --> G{"Same session running elsewhere,<br/>or a later record in another live terminal?"}
+    G -- "yes" --> Y["Step back, logged as not resumed"]
+    G -- "no" --> I{"Launcher or agent installed?"}
+    I -- "no" --> X["No resume, nothing logged<br/>never another account"]
+    I -- "yes" --> J["Wait for this tab's turn"]
+    J --> K["Print the resume command, start the watcher"]
+```
 
 ## Install
 
@@ -32,7 +62,7 @@ Tested on macOS with zsh. Requirements: `hc` in `PATH`, Python 3.9 or newer.
 4. Grok: nothing to add. It runs the hooks of `~/.claude/settings.json` itself.
 5. Paste [`shell/zshrc-resume-trigger.zsh`](../shell/zshrc-resume-trigger.zsh) into `~/.zshrc`.
 6. Sessions that were already running do not pick up new hooks. Run `hc-claude-resume seed` once to record the running Claude Code sessions.
-7. Several Claude accounts: use one launcher per account, see [`examples/claude-account-launcher.sh`](../examples/claude-account-launcher.sh). The record stores the label and the resume uses the same launcher. A missing launcher means no resume; the tool never falls back to another account.
+7. Several Claude accounts: use one launcher per account, see [one account per tab](claude-accounts.md) and [`examples/claude-account-launcher.sh`](../examples/claude-account-launcher.sh). The record stores the label and the resume uses the same launcher. A missing launcher means no resume; the tool never falls back to another account.
 
 Check with `hc-claude-resume list` and the log `~/.local/state/hc-claude-resume/<core>/events.log`.
 
@@ -49,6 +79,20 @@ Check with `hc-claude-resume list` and the log `~/.local/state/hc-claude-resume/
 | Tab was a bare shell before the hook existed | `hc-claude-resume set <terminal> <agent> <session-id> [folder]` | Writes a record by hand; the next shell in that terminal resumes it |
 | Record older than 30 days | Pruned | |
 
+The life of a Claude Code record:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Recorded: SessionStart or first prompt
+    Recorded --> Recorded: every prompt refreshes it
+    Recorded --> Removed: user quits, clears, logs out
+    Recorded --> Kept: agent killed, shutdown, closed terminal
+    Kept --> Resumed: terminal recovered as a shell
+    Resumed --> Recorded: the resumed session records itself again
+    Kept --> Removed: recorded in another tab, or older than 30 days
+    Removed --> [*]
+```
+
 ## One session, two tabs
 
 A record survives when an agent dies in place. If the user then continues the same session in another tab, two records point at one session, and after the next reboot both tabs open it. This happened once.
@@ -64,6 +108,26 @@ After a reboot all shells reach their first prompt together. Starting all agents
 
 **Queue.** One agent start at a time per core. The next start waits until the previous agent reports a status, 20 s at most per agent, 300 s at most in total. While a tab waits, its prompt shows `hc-claude-resume: waiting for this tab's turn to resume its agent (ctrl+c skips)`.
 
+```mermaid
+sequenceDiagram
+    participant A as Tab A
+    participant S as Start slot file, one per core
+    participant B as Tab B
+    participant C as herdr-core
+    A->>S: lock, write my mark, unlock
+    A->>A: runs its resume command
+    B->>S: lock, read the mark of tab A
+    Note over B,C: prompt shows the waiting line, ctrl+c skips
+    loop every 0.5 s, 2 s to 20 s
+        B->>C: has tab A reported a status?
+        C-->>B: not yet
+    end
+    C-->>B: tab A reports idle
+    B->>S: write my mark, unlock
+    B->>B: runs its resume command
+    Note over A,B: a third tab waits for the lock all this time
+```
+
 **Watcher.** For every resume a detached `status-check` process watches the tab:
 
 - A status appears: done, logged as `reports <state> after Ns`.
@@ -72,6 +136,26 @@ After a reboot all shells reach their first prompt together. Starting all agents
 - It kills the terminal's program. The core recovers the terminal as a shell and `check` resumes the session again, through the same queue.
 - At most 2 restarts per terminal per hour. Then: `giving up (restart the tab's program by hand)`.
 - A tab that is busy, shows a dialog, or has text in the input box is left alone. After 4 minutes without an idle prompt the watcher stops.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Watching: resume command printed
+    Watching --> Done: a status is reported
+    Watching --> IdleSeen: empty input box, no status
+    IdleSeen --> Watching: busy, dialog or typing
+    IdleSeen --> Missed: idle for 12 s without status
+    Missed --> Done: off switch present, only logged
+    Missed --> GaveUp: 2 restarts already done this hour
+    Missed --> WaitQuiet: restart allowed
+    WaitQuiet --> Watching: busy, dialog or typing
+    WaitQuiet --> Done: a status is reported after all
+    WaitQuiet --> Restart: 3 quiet looks in a row, or 10 minutes passed
+    Restart --> [*]: terminal program killed, check resumes the session, a new watcher starts
+    Watching --> LeftAlone: 4 minutes without an idle prompt
+    Done --> [*]
+    GaveUp --> [*]
+    LeftAlone --> [*]
+```
 
 Knobs, all constants at the top of the script:
 

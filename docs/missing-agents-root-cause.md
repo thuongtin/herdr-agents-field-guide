@@ -18,6 +18,14 @@ The agent was running in the foreground of the terminal. It simply never told th
 
 herdr-core builds the status of a terminal only from what the program inside writes to the terminal: OSC 7501 reports. There is no command and no API call that sets a status from outside. A program that never sends a report has `reported: false` for its whole life and is invisible to anything that lists agents by status.
 
+```mermaid
+flowchart LR
+    P["Program in the terminal<br/>an agent"] -->|"OSC 7501 status report"| C["herdr-core<br/>status of the terminal"]
+    C --> L["Agents list of the app"]
+    C --> G["hc get, hc list"]
+    X["Anything outside the terminal"] -. "no way to set a status" .-> C
+```
+
 So the question became: why does Claude Code not send its reports in some tabs?
 
 ## What Claude Code does at startup
@@ -28,6 +36,23 @@ Seen in the debug log (`claude --debug-file <file>`, line "Terminal capabilities
 2. It waits for the answers with a fixed deadline of about 2 seconds. The clock starts when the questions are sent, and it runs while Claude Code does its own startup work (loading the transcript, plugins, hooks, MCP servers, the file index).
 3. When the deadline passes, every capability that has no answer yet gets its default. For program status the default is "no".
 4. It does not ask again. An answer that arrives after the deadline is ignored.
+
+```mermaid
+sequenceDiagram
+    participant CC as Claude Code
+    participant T as Terminal of herdr-core
+    participant L as Agents list
+    CC->>T: OSC 7501 query, sent once at startup
+    T-->>CC: reply after 0.03 to 0.15 s
+    alt reply handled within about 2 s
+        Note over CC: programStatus=yes
+        CC->>T: status reports, working or idle
+        T->>L: the tab is listed with its state
+    else CPU contended, reply handled after the deadline
+        Note over CC,T: programStatus=no for the whole session<br/>no second query, no status report
+        Note over T,L: the tab is missing although the agent runs
+    end
+```
 
 A session that settled on "no" logs:
 
@@ -50,6 +75,17 @@ The 2 second figure and the missing second probe were read from the shipped clie
 The terminal is not the slow side. A small program that sends `OSC 7501 ; ?` twice a second from inside a terminal of the same core ([`tools/osc7501-pinger.py`](../tools/osc7501-pinger.py)) got every answer within 0.15 s, even at the worst moment of a 12 session start.
 
 The slow side is the agent. After a reboot all recovered shells reach their prompt together and all agents start in the same seconds. Each one indexes its folder, starts its MCP servers and runs its hooks. When the process does not get enough CPU time to read its input within the deadline, the probe is lost.
+
+```mermaid
+flowchart TD
+    A["Reboot"] --> B["All recovered shells reach their first prompt together"]
+    B --> C["All agents start in the same seconds"]
+    C --> D["Each agent indexes its folder, starts MCP servers, runs hooks"]
+    D --> E["Short bursts of CPU contention<br/>a 50 ms loop takes 5 to 20 times longer"]
+    E --> F["Some agents handle the terminal's reply after their 2 s deadline"]
+    F --> G["Those sessions never report a status"]
+    G --> H["Agents list shows only part of the running agents"]
+```
 
 Measured facts that support this:
 
@@ -81,6 +117,16 @@ The defect is inside the agent, so the only complete fix is upstream: accept a l
 3. That tab is restarted with the same session once the machine is quiet. A restart during the load peak would only miss again.
 4. At most 2 restarts per tab per hour. After that the tool gives up and says so in its log.
 5. A tab that is busy, shows a dialog or is being typed in is never touched.
+
+```mermaid
+flowchart LR
+    U["Complete fix, upstream<br/>accept a late reply or ask again"] -. "not available yet" .-> M["Missed probe"]
+    Q["Start queue"] -->|"fewer misses"| M
+    M --> W["Watcher sees an idle prompt without status"]
+    W --> R["Restart with the same session<br/>when the machine is quiet"]
+    R -->|"at most 2 times per hour"| S["Status reported"]
+    R -->|"still missing"| X["Give up and log it"]
+```
 
 Details and the knobs: [resume after a reboot](resume-after-reboot.md).
 

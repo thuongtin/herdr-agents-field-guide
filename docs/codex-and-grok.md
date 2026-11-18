@@ -20,6 +20,25 @@ Codex 0.169 can run its sessions inside one shared background server. A session 
 - A tab started with `codex --no-daemon` is recorded normally. The Herdr app's own Codex menu entry starts it that way.
 - `--no-daemon` is one of the flags carried over to the resume command, so a resumed session stays recordable.
 
+```mermaid
+flowchart LR
+    subgraph shared["codex, shared server"]
+        direction TB
+        T1["Tab 1: codex"] --> SV["One server<br/>environment of the tab that started it first"]
+        T2["Tab 2: codex"] --> SV
+        SV --> H1["Hook runs inside the server"]
+        H1 --> Q["Which tab is this session in?<br/>cannot be answered"]
+        Q --> N["No record, the tab comes back as a shell"]
+    end
+    subgraph own["codex --no-daemon"]
+        direction TB
+        T3["Tab 3: codex --no-daemon"] --> P["Codex process under the tab's shell"]
+        P --> H2["Hook is a child of that process"]
+        H2 --> R["Record for tab 3"]
+    end
+    shared ~~~ own
+```
+
 If you type `codex` by hand in a tab and want it back after a reboot, type `codex --no-daemon`, or make that an alias.
 
 ### No end hook
@@ -29,6 +48,25 @@ Codex fires SessionStart at the first prompt, not at start, and has no SessionEn
 - A Codex tab where nothing was typed yet has no record.
 - Quitting Codex cannot remove the record directly. Instead, when a shell shows its first prompt in a terminal whose record says "an agent was here", and the terminal's program is still the same one, the agent was quit in place. A detached `reap` then removes the record 25 s later, if the agent is still gone and the terminal's program is still unchanged.
 - The delay matters at shutdown: the agent can die a moment before its shell does. Without the delay, a reboot would look like the user quitting, and the record would be gone exactly when it is needed.
+
+```mermaid
+sequenceDiagram
+    participant G as Codex or Grok
+    participant SH as Tab's shell
+    participant R as reap, detached
+    participant F as Record file
+    alt user quits the agent in place
+        G->>SH: exits, the shell shows a prompt
+        SH->>R: check sees the same terminal program and no agent
+        R->>R: waits 25 s
+        R->>F: agent still gone, program unchanged, remove
+    else shutdown or reboot
+        G->>SH: dies a moment before the shell
+        SH->>R: may still start a reap
+        Note over SH,R: both are killed by the shutdown within the 25 s
+        Note over R,F: record kept, the session is resumed<br/>after the reboot
+    end
+```
 
 ### Sessions started by another Codex session
 
@@ -47,6 +85,32 @@ codex resume [carried flags] <session-id>
 - Grok's end reasons were not found documented, so its records are removed the same way as Codex records: by the delayed `reap`.
 - One-shot runs (`-p`, `--single`, `--prompt-file`, `--prompt-json`) are not recorded.
 - Resume: `grok [carried flags] --resume <session-id>`.
+
+The three agents side by side:
+
+```mermaid
+flowchart LR
+    subgraph claude["Claude Code"]
+        direction TB
+        C1["Hooks in ~/.claude/settings.json"] --> C2["Recorded at start"]
+        C2 --> C3["End hook tells quit from kill"]
+        C3 --> C4["Watched and restarted on a missed probe"]
+    end
+    subgraph codex["Codex"]
+        direction TB
+        X1["Hooks in ~/.codex/hooks.json<br/>you review them"] --> X2["Recorded at the first prompt<br/>only with --no-daemon"]
+        X2 --> X3["No end hook, delayed reap"]
+        X3 --> X4["In the queue, never restarted"]
+    end
+    subgraph grok["Grok"]
+        direction TB
+        G1["Runs the Claude Code hooks itself"] --> G2["Recorded, session id from GROK_SESSION_ID"]
+        G2 --> G3["End reasons unknown, delayed reap"]
+        G3 --> G4["In the queue, never restarted"]
+    end
+    claude ~~~ codex
+    codex ~~~ grok
+```
 
 ## Bringing back a tab that was already lost
 

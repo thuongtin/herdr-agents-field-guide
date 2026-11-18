@@ -25,6 +25,16 @@ Everything here was seen on one machine by one person between 2026-11-12 and 202
 
 The queue, the watcher and the same-session rule were written after the third reboot. **They have not been through a real reboot yet.**
 
+```mermaid
+flowchart TD
+    R1["Reboot 1, no tool<br/>layout back, every agent gone"] --> T1["Resume for Claude Code"]
+    T1 --> R2["Reboot 2<br/>Claude Code back on its accounts<br/>default account: Not logged in"]
+    R2 --> T2["Core started in the GUI login<br/>resume for Codex and Grok"]
+    T2 --> R3["Reboot 3<br/>all recorded tabs resumed<br/>9 of 14 without status"]
+    R3 --> T3["Queue, watcher, same-session rule"]
+    T3 --> R4["Reboot 4: has not happened yet"]
+```
+
 ## Simulated reboots, 12 sessions
 
 Separate core, all shells lost at once, see [reproduce](reproduce.md). "With status" counts Claude Code tabs that reported a status.
@@ -41,6 +51,17 @@ Separate core, all shells lost at once, see [reproduce](reproduce.md). "With sta
 
 One run per variant is thin. The numbers show that spacing alone fails; they do not show a failure rate.
 
+The same attempts in the order they were made:
+
+```mermaid
+flowchart TD
+    A["All agents start together<br/>real reboot: 9 of 14 without status"] --> B["Starts 2 s apart<br/>2 of 12 without status, in both runs"]
+    B --> C["One start at a time<br/>0 of 12 on a calm run, 4 of 13 starts missed under heavy load"]
+    C --> D["Queue plus watcher, restart right away<br/>11 of 12, then 12 of 12 after the restart"]
+    D --> E["Queue plus watcher plus quiet-machine wait<br/>12 of 12 at the first try, one run"]
+    E --> F["Still open: a real reboot with this version"]
+```
+
 ## Where the time goes
 
 | Measurement | Result |
@@ -52,6 +73,15 @@ One run per variant is thin. The numbers show that spacing alone fails; they do 
 | Time until 12 tabs are all resumed through the queue, calm machine | About 35 s |
 
 Load average did not line up with the misses. It moves too slowly to show a burst of a few seconds; the busy loop does.
+
+```mermaid
+flowchart LR
+    Q["Agent sends its query at startup"] --> T["Terminal replies<br/>0.03 to 0.15 s, always"]
+    T --> A["Agent process gets CPU time to read the reply<br/>contention factor 1.0 when idle, 5 to 20 around a miss"]
+    A --> D{"Read within about 2 s?"}
+    D -- "yes" --> Y["Status reported"]
+    D -- "no" --> N["No status for the whole session"]
+```
 
 ## Forced misses
 

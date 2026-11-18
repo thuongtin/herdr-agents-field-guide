@@ -118,15 +118,100 @@ class StatementTests(unittest.TestCase):
         self.assertGreaterEqual(len(re.findall(r"\| `[A-Z_]+` \| [0-9.]+ \|", table)), 8)
 
 
+def mermaid_blocks(path):
+    """The mermaid blocks of a markdown file, each as a list of lines without the fences."""
+    blocks, current = [], None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if current is None:
+            if stripped == "```mermaid":
+                current = []
+        elif stripped == "```":
+            blocks.append(current)
+            current = None
+        else:
+            current.append(line)
+    if current is not None:
+        raise AssertionError(f"unclosed mermaid block in {path.name}")
+    return blocks
+
+
+class DiagramTests(unittest.TestCase):
+    """The diagrams are rendered by the site that shows the markdown, so only their shape is checked here."""
+
+    KINDS = ("flowchart TD", "flowchart LR", "sequenceDiagram", "stateDiagram-v2")
+    PAGES = [*READMES, *DOCS]
+
+    def test_every_page_has_a_diagram(self):
+        for path in self.PAGES:
+            self.assertTrue(mermaid_blocks(path), path.name)
+
+    def test_code_fences_are_balanced(self):
+        for path in self.PAGES:
+            fences = [l for l in path.read_text(encoding="utf-8").splitlines() if l.strip().startswith("```")]
+            self.assertEqual(len(fences) % 2, 0, path.name)
+
+    def test_diagrams_start_with_a_known_kind(self):
+        for path in self.PAGES:
+            for block in mermaid_blocks(path):
+                self.assertIn(block[0].strip(), self.KINDS, (path.name, block[0]))
+                self.assertGreater(len(block), 2, (path.name, block[0]))
+
+    def test_diagram_text_avoids_what_breaks_rendering(self):
+        for path in self.PAGES:
+            for block in mermaid_blocks(path):
+                for line in block:
+                    where = (path.name, line)
+                    self.assertNotIn("`", line, where)
+                    self.assertNotIn(";", line, where)
+                    self.assertNotIn("\t", line, where)
+                    # The only tag allowed in a label is a line break; "<label>" would be read as HTML.
+                    self.assertIsNone(re.search(r"<(?!br/>)[A-Za-z/]", line), where)
+
+    def test_flowchart_labels_are_quoted(self):
+        for path in self.PAGES:
+            for block in mermaid_blocks(path):
+                if not block[0].strip().startswith("flowchart"):
+                    continue
+                for line in block[1:]:
+                    where = (path.name, line)
+                    self.assertEqual(line.count('"') % 2, 0, where)
+                    # A node or edge label opens with [" or {" or |" and never with a bare bracket.
+                    self.assertIsNone(re.search(r"[\[{|](?![\"\s]|$)[^\"\]}|]", line), where)
+
+    def test_readme_diagrams_match_in_both_languages(self):
+        vi, en = (mermaid_blocks(path) for path in READMES)
+        self.assertEqual(len(vi), len(en))
+        for a, b in zip(vi, en):
+            self.assertEqual(len(a), len(b))
+            self.assertEqual(a[0].strip(), b[0].strip())
+
+
 class ExampleTests(unittest.TestCase):
-    def test_json_examples_parse_and_call_the_tool(self):
-        for path in (ROOT / "examples").glob("*.json"):
-            data = json.loads(path.read_text(encoding="utf-8"))
+    HOOK_EXAMPLES = ("claude-settings-hooks.json", "codex-hooks.json")
+
+    def test_every_json_example_parses(self):
+        names = sorted(path.name for path in (ROOT / "examples").glob("*.json"))
+        self.assertEqual(names, sorted([*self.HOOK_EXAMPLES, "claude-account-settings.json"]))
+        for name in names:
+            json.loads((ROOT / "examples" / name).read_text(encoding="utf-8"))
+
+    def test_hook_examples_call_the_tool(self):
+        for name in self.HOOK_EXAMPLES:
+            data = json.loads((ROOT / "examples" / name).read_text(encoding="utf-8"))
             commands = [h["command"] for groups in data["hooks"].values() for g in groups for h in g["hooks"]]
-            self.assertTrue(commands, path.name)
+            self.assertTrue(commands, name)
             for command in commands:
                 self.assertIn("hc-claude-resume", command)
                 self.assertIn(" hook", command)
+
+    def test_account_settings_example_holds_a_placeholder_only(self):
+        data = json.loads((ROOT / "examples/claude-account-settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(data), ["env"])
+        self.assertEqual(list(data["env"]), ["CLAUDE_CODE_OAUTH_TOKEN"])
+        value = data["env"]["CLAUDE_CODE_OAUTH_TOKEN"]
+        self.assertTrue(value.startswith("<") and value.endswith(">"), "the example must not look like a token")
+        self.assertIn(" ", value)
 
     def test_claude_example_has_the_three_events(self):
         data = json.loads((ROOT / "examples/claude-settings-hooks.json").read_text(encoding="utf-8"))

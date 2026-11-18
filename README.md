@@ -16,6 +16,22 @@ Repo gồm **tài liệu, một công cụ nhỏ (`hc-claude-resume`) và bộ s
 | Lần 2 | Claude Code tự quay lại đúng tài khoản. Codex, Grok chưa quay lại. Một số tab báo "Not logged in" | Core được tạo từ một kết nối ssh nên không đọc được Keychain |
 | Lần 3 | Mọi agent quay lại, nhưng 9 trên 14 tab Claude Code không hiện trong danh sách Agents | Claude Code hỏi terminal đúng một lần lúc khởi động và chỉ chờ khoảng 2 giây. Khi khoảng 30 agent cùng khởi động, nó đọc câu trả lời quá muộn rồi không bao giờ hỏi lại |
 
+Đường đi của một tab sau khi khởi động lại, với công cụ trong repo này:
+
+```mermaid
+flowchart TD
+    A["Khởi động lại, đăng xuất hoặc core chết"] --> B["herdr-core khôi phục từng terminal<br/>thành shell trơn"]
+    B --> C{"Tab này có bản ghi không?"}
+    C -- "không" --> S["Tab vẫn là shell"]
+    C -- "có" --> D["Các agent khởi động lần lượt"]
+    D --> E["Đúng phiên cũ, đúng tài khoản cũ"]
+    E --> F{"Agent có báo trạng thái không?"}
+    F -- "có" --> G["Hiện trong danh sách Agents"]
+    F -- "không, lỡ lần hỏi lúc khởi động" --> H["Khởi động lại agent khi máy đã rảnh"]
+    H -- "tối đa 2 lần" --> F
+    H -- "vẫn không có" --> I["Dừng và ghi log"]
+```
+
 ## Bài học chính
 
 1. **herdr-core giữ terminal, không giữ agent.** Sau khi mất terminal (khởi động lại, đăng xuất, core chết), tab quay lại dưới dạng shell trơn. Muốn agent quay lại phải tự ghi nhớ phiên nào chạy ở tab nào, bằng tài khoản nào. Xem [Resume after a reboot](docs/resume-after-reboot.md).
@@ -26,15 +42,29 @@ Repo gồm **tài liệu, một công cụ nhỏ (`hc-claude-resume`) và bộ s
 6. **Core được sinh ra ở đâu thì mọi tab chịu môi trường ở đó.** Core sinh từ ssh: không đọc được Keychain. Core sinh từ một phiên agent: mọi tab bị coi là phiên con, không lưu transcript. Xem [Core environment](docs/core-environment.md).
 7. **Codex chạy bằng server nền dùng chung thì không ghi nhận được tab.** Chạy `codex --no-daemon` thì được. Hook mới của Codex cần chính bạn duyệt. Xem [Codex and Grok](docs/codex-and-grok.md).
 8. **Tái lập trước khi kết luận.** Mọi thử nghiệm chạy trong một core riêng (`HC_SESSION=<tên>`), dùng bản sao phiên, không đụng vào tab thật. Xem [Reproduce](docs/reproduce.md).
+9. **Mỗi tab một tài khoản Claude thì mọi lệnh phải đi qua launcher của tài khoản đó.** Transcript dùng chung, nên tài khoản nào cũng tiếp tục được phiên nào mà không có cảnh báo. Dòng `claude --resume <id>` mà Claude Code in ra lúc thoát sẽ đưa phiên sang tài khoản mặc định. Xem [One account per tab](docs/claude-accounts.md).
 
 ## Trong repo có gì
 
-Tài liệu chi tiết viết bằng tiếng Anh.
+Tài liệu chi tiết viết bằng tiếng Anh, trang nào cũng có sơ đồ mermaid. Gặp triệu chứng nào thì đọc trang nào:
+
+```mermaid
+flowchart LR
+    Q{"Bạn đang thấy gì?"}
+    Q -- "tab chỉ còn là shell" --> R["resume-after-reboot"]
+    Q -- "agent đang chạy nhưng không có trong danh sách" --> M["missing-agents-root-cause"]
+    Q -- "Not logged in, hoặc không lưu transcript" --> C["core-environment"]
+    Q -- "tab vào nhầm tài khoản" --> A["claude-accounts"]
+    Q -- "Codex hoặc Grok không quay lại" --> X["codex-and-grok"]
+    Q -- "không nhận ra agent, mục menu mở ra shell" --> P["shell-pitfalls"]
+    Q -- "trường hợp khác" --> T["troubleshooting"]
+```
 
 | Đường dẫn | Nội dung |
 |---|---|
 | [docs/missing-agents-root-cause.md](docs/missing-agents-root-cause.md) | Triệu chứng, bằng chứng, những cách đã thử mà không hiệu quả, cách xử lý hiện tại |
 | [docs/resume-after-reboot.md](docs/resume-after-reboot.md) | Cơ chế ghi nhớ và resume, cách cài, các tham số |
+| [docs/claude-accounts.md](docs/claude-accounts.md) | Mỗi tab một tài khoản Claude Code: token dài hạn, file cài đặt và launcher theo tài khoản, cách biết tab đang dùng tài khoản nào, bẫy nhầm tài khoản |
 | [docs/codex-and-grok.md](docs/codex-and-grok.md) | Khác biệt của Codex và Grok, cách khôi phục tab đã mất |
 | [docs/core-environment.md](docs/core-environment.md) | Core sinh từ ssh, core sinh từ một phiên agent, cách sửa mà không mất tab |
 | [docs/shell-pitfalls.md](docs/shell-pitfalls.md) | Plugin bọc shell, instant prompt, gửi lệnh giữa các terminal, bẫy nhầm tài khoản |
@@ -45,7 +75,7 @@ Tài liệu chi tiết viết bằng tiếng Anh.
 | [docs/privacy.md](docs/privacy.md) | Repo công khai gì, cố ý bỏ gì, công cụ lưu gì trên máy bạn |
 | [bin/hc-claude-resume](bin/hc-claude-resume) | Công cụ ghi nhớ và resume (Python, một file, không phụ thuộc thư viện ngoài) |
 | [shell/](shell) | Các đoạn dán vào `~/.zshrc` và `~/.zshenv` |
-| [examples/](examples) | Mẫu hook cho Claude Code và Codex, mẫu launcher theo tài khoản, mẫu LaunchAgent |
+| [examples/](examples) | Mẫu hook cho Claude Code và Codex, mẫu launcher và file cài đặt theo tài khoản (chỉ có chỗ giữ chỗ, không có token), mẫu LaunchAgent |
 | [tools/](tools) | Script giả lập khởi động lại, thử chức năng, đo tranh chấp CPU, đo thời gian terminal trả lời |
 | [tests/](tests) | Kiểm tra logic của công cụ và kiểm tra tài liệu (chạy được trên CI, không cần `hc`) |
 

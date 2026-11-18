@@ -4,6 +4,22 @@
 
 The work behind this guide was done on private machines with private accounts and sessions. The repository describes techniques and outcomes. It is not a copy of that setup.
 
+```mermaid
+flowchart LR
+    subgraph machine["Kept private"]
+        direction TB
+        L["Raw logs, debug logs, process samples"] ~~~ S["Session ids, transcripts, tab titles"]
+        S ~~~ C["Tokens, settings files, account labels"]
+        C ~~~ N["User names, hosts, paths, addresses"]
+    end
+    subgraph repo["Published here"]
+        direction TB
+        T["Tool, snippets and test scripts with placeholders"] ~~~ V["Product names and tested versions"]
+        V ~~~ R["Summaries, failed attempts, untested cases"]
+    end
+    machine -->|"described and summarized, never copied"| repo
+```
+
 ## Included
 
 - The resume tool, shell snippets and test tools, with every personal value replaced by a placeholder or an example label (`work`, `probe`, `__HOME__`, `<terminal>`, `<session id>`).
@@ -31,6 +47,20 @@ In `~/.local/state/hc-claude-resume/<core>/`:
 | `events.log` | One line per event, with terminal, session id and reason |
 
 No token, no settings content and no conversation text is stored or read. The tool sends nothing over the network. The folder is created with mode 0700.
+
+```mermaid
+flowchart TD
+    H["Agent hook"] --> J["TERMINAL.json<br/>agent, session id, folder, account label"]
+    K["check and the watcher"] --> E["events.log"]
+    K --> RT["TERMINAL.retries"]
+    K --> SS["start-slot"]
+    J --> F["State folder on your machine, mode 0700"]
+    E --> F
+    RT --> F
+    SS --> F
+    X["Tokens, settings content, conversation text"] -. "not read, not stored" .-> F
+    F -. "nothing is sent" .-> NET["Network"]
+```
 
 Still, session ids together with folder paths say what you work on. Treat that folder as private.
 
