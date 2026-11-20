@@ -6,7 +6,7 @@ Ghi chép thực tế khi chạy nhiều coding agent (Claude Code, Codex, Grok)
 
 Repo gồm **tài liệu, một công cụ nhỏ (`hc-claude-resume`) và bộ script tái lập**. Đây không phải sản phẩm chính thức và không liên kết với nhà phát triển của Herdr, Claude Code, Codex hay Grok.
 
-**Thời gian kiểm chứng: 12 đến 18/11/2026**, trên một máy macOS. Các phiên bản nêu bên dưới là bản đã thử, không mặc định là bản mới nhất. Số liệu do tác giả tổng hợp từ phiên chạy thật; log gốc là dữ liệu riêng tư nên không công khai. Bạn nên tự tái lập thay vì coi các bảng trong repo là bằng chứng có thể kiểm toán độc lập.
+**Thời gian kiểm chứng: 12 đến 20/11/2026**, trên một máy macOS. Các phiên bản nêu bên dưới là bản đã thử, không mặc định là bản mới nhất. Số liệu do tác giả tổng hợp từ phiên chạy thật; log gốc là dữ liệu riêng tư nên không công khai. Bạn nên tự tái lập thay vì coi các bảng trong repo là bằng chứng có thể kiểm toán độc lập.
 
 ## Chuyện đã xảy ra
 
@@ -15,6 +15,7 @@ Repo gồm **tài liệu, một công cụ nhỏ (`hc-claude-resume`) và bộ s
 | Lần 1 | Tab, tên tab, thư mục còn nguyên, nhưng mọi agent biến mất: tab chỉ còn là shell. Gõ lệnh tiếp tục thì vào nhầm tài khoản | herdr-core chỉ khôi phục terminal thành shell, không chạy lại lệnh cũ |
 | Lần 2 | Claude Code tự quay lại đúng tài khoản. Codex, Grok chưa quay lại. Một số tab báo "Not logged in" | Core được tạo từ một kết nối ssh nên không đọc được Keychain |
 | Lần 3 | Mọi agent quay lại, nhưng 9 trên 14 tab Claude Code không hiện trong danh sách Agents | Claude Code hỏi terminal đúng một lần lúc khởi động và chỉ chờ khoảng 2 giây. Khi khoảng 30 agent cùng khởi động, nó đọc câu trả lời quá muộn rồi không bao giờ hỏi lại |
+| Lần 4 | Mọi agent quay lại lần lượt và mọi tab Claude Code đều báo trạng thái. Nhưng 6 tab khởi động thiếu thư mục dự án: 4 tab chạy ở thư mục home, 2 tab dừng ở câu hỏi chọn thư mục | Thư mục nằm trên ổ ngoài có mã hóa, được mount rất lâu sau khi các tab quay lại. Công cụ bỏ qua thư mục đang thiếu và vẫn khởi động agent. Giờ công cụ chờ thư mục xuất hiện |
 
 Đường đi của một tab sau khi khởi động lại, với công cụ trong repo này:
 
@@ -23,7 +24,10 @@ flowchart TD
     A["Khởi động lại, đăng xuất hoặc core chết"] --> B["herdr-core khôi phục từng terminal<br/>thành shell trơn"]
     B --> C{"Tab này có bản ghi không?"}
     C -- "không" --> S["Tab vẫn là shell"]
-    C -- "có" --> D["Các agent khởi động lần lượt"]
+    C -- "có" --> K{"Thư mục của phiên đã có chưa?"}
+    K -- "chưa, ổ chưa mount" --> W["Tab chờ thư mục xuất hiện<br/>không khởi động ở chỗ khác"]
+    W --> K
+    K -- "có" --> D["Các agent khởi động lần lượt"]
     D --> E["Đúng phiên cũ, đúng tài khoản cũ"]
     E --> F{"Agent có báo trạng thái không?"}
     F -- "có" --> G["Hiện trong danh sách Agents"]
@@ -43,6 +47,7 @@ flowchart TD
 7. **Codex chạy bằng server nền dùng chung thì không ghi nhận được tab.** Chạy `codex --no-daemon` thì được. Hook mới của Codex cần chính bạn duyệt. Xem [Codex and Grok](docs/codex-and-grok.md).
 8. **Tái lập trước khi kết luận.** Mọi thử nghiệm chạy trong một core riêng (`HC_SESSION=<tên>`), dùng bản sao phiên, không đụng vào tab thật. Xem [Reproduce](docs/reproduce.md).
 9. **Mỗi tab một tài khoản Claude thì mọi lệnh phải đi qua launcher của tài khoản đó.** Transcript dùng chung, nên tài khoản nào cũng tiếp tục được phiên nào mà không có cảnh báo. Dòng `claude --resume <id>` mà Claude Code in ra lúc thoát sẽ đưa phiên sang tài khoản mặc định. Xem [One account per tab](docs/claude-accounts.md).
+10. **Thiếu thư mục thì chờ, không khởi động ở chỗ khác.** Sau khi khởi động lại, ổ đĩa có thể xuất hiện muộn hơn các tab vài phút hoặc vài giờ. Agent khởi động ở thư mục khác sẽ làm việc trên nhầm file, rồi chính hook của nó ghi thư mục đó thành thư mục của phiên, nên lỗi còn nguyên sau lần khởi động lại kế tiếp. Còn khi chuyển workspace sang chỗ mới, hãy đổi tên bản cũ: chừng nào bản cũ còn đó, mọi đường dẫn cũ vẫn chạy được, nhưng trên file cũ. Xem [Resume after a reboot](docs/resume-after-reboot.md) và [Troubleshooting](docs/troubleshooting.md).
 
 ## Trong repo có gì
 
@@ -105,15 +110,15 @@ python3 -m unittest discover -s tests -v
 | Thành phần | Phiên bản |
 |---|---|
 | herdr-core (`hc`) | 0.1.21 |
-| Claude Code | 2.1.326, 2.1.327 |
-| Codex CLI | 0.169.1 |
+| Claude Code | 2.1.326, 2.1.327; 2.1.329 khi sửa lỗi thư mục |
+| Codex CLI | 0.169.1; 0.170.0 khi sửa lỗi thư mục |
 | Grok | 1.0.88 |
 | Hệ điều hành, shell | macOS 27.0.1, zsh 5.9 |
 | Python | 3.14 (script phân tích cú pháp được với 3.9) |
 
 ## Giới hạn cần biết
 
-- Hàng đợi khởi động và bộ theo dõi mới chỉ qua **giả lập khởi động lại** trong core riêng, **chưa qua một lần khởi động lại thật**.
+- Hàng đợi khởi động đã qua một lần khởi động lại thật (26 tab agent, mọi tab Claude Code đều báo trạng thái). Việc khởi động lại của bộ theo dõi và việc chờ thư mục đang thiếu mới chỉ qua **giả lập khởi động lại** trong core riêng, **chưa qua một lần khởi động lại thật**.
 - Mỗi biến thể chỉ chạy một hoặc hai lượt. Số liệu đủ để thấy "giãn cách không đủ", không đủ để nói tỉ lệ lỗi.
 - Hạn 2 giây và việc chỉ hỏi một lần là hành vi quan sát được ở hai phiên bản Claude Code nêu trên, không phải cam kết của nhà phát triển, và có thể đổi ở bất kỳ bản nào.
 - Phiên mới (không phải phiên resume) vẫn có thể mất trạng thái khi khởi động lúc máy đang tải nặng. Công cụ chỉ theo dõi các tab do nó resume.

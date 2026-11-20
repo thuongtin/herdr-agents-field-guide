@@ -15,12 +15,29 @@ if [[ -o interactive && -n "$HC_TERMINAL_ID" && -z "$ZSH_EXECUTION_STRING" && -z
    && [[ -f "$HOME/.local/state/hc-claude-resume/${${HC_TERMINAL_SOCKET:h:t}:-default}/$HC_TERMINAL_ID.json" ]]; then
   _hc_claude_resume_once() {
     add-zle-hook-widget -d line-init _hc_claude_resume_once
-    local cmd
+    local tool="$HOME/.local/bin/hc-claude-resume" cmd rc
+    local turn="hc-claude-resume: waiting for this tab's turn to resume its agent (ctrl+c skips)"
     # Agent starts take turns after a reboot, so `check` can hold this line for a while.
-    zle -M "hc-claude-resume: waiting for this tab's turn to resume its agent (ctrl+c skips)"
+    zle -M "$turn"
     zle -R
-    cmd=$("$HOME/.local/bin/hc-claude-resume" check 2>/dev/null)
-    local rc=$?
+    cmd=$("$tool" check 2>/dev/null)
+    rc=$?
+    if (( rc == 3 )) && [[ -n "$cmd" ]]; then
+      # The session's folder does not exist, for example on a drive that is not mounted
+      # yet. Wait for it: the agent is never started in another folder.
+      local folder=$cmd
+      zle -M "hc-claude-resume: waiting for the session's folder $folder (ctrl+c skips)"
+      zle -R
+      if "$tool" wait-folder 2>/dev/null; then
+        zle -M "$turn"
+        zle -R
+        cmd=$("$tool" check 2>/dev/null)
+        rc=$?
+      else
+        zle -M "hc-claude-resume: agent not resumed, folder missing: $folder"
+        return 0
+      fi
+    fi
     zle -M ""
     (( rc == 0 )) && [[ -n "$cmd" ]] || return 0
     # The leading space keeps the line out of the history when HIST_IGNORE_SPACE is set.

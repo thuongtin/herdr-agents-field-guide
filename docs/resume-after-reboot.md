@@ -28,7 +28,7 @@ flowchart LR
 
 1. **Record.** A hook of the agent writes one small JSON file per terminal: agent, session id, folder, account label, the agent's pid and the pid of the terminal's program. No tokens are stored.
 2. **Detect the loss.** At the first prompt of a shell, `check` compares the record with the terminal. The agent is resumed only when the terminal's program changed since the record was written, or the record is older than the last boot. Both mean the terminal was lost and recovered.
-3. **Resume.** `check` prints one command line and the shell runs it: `cd <folder> && claude-<label> --resume <id>`, `codex resume [flags] <id>` or `grok [flags] --resume <id>`.
+3. **Resume.** `check` prints one command line and the shell runs it: `cd <folder> && claude-<label> --resume <id>`, `codex resume [flags] <id>` or `grok [flags] --resume <id>`. All three start in the recorded folder. When that folder does not exist, nothing is started: the tab waits for it, see [a folder that is not there yet](#a-folder-that-is-not-there-yet).
 
 Things that deliberately do not resume: quitting the agent in place, a crash in place, a subshell, a second shell in the same terminal. In those cases the terminal's program is still the same one.
 
@@ -48,7 +48,11 @@ flowchart TD
     G -- "yes" --> Y["Step back, logged as not resumed"]
     G -- "no" --> I{"Launcher or agent installed?"}
     I -- "no" --> X["No resume, nothing logged<br/>never another account"]
-    I -- "yes" --> J["Wait for this tab's turn"]
+    I -- "yes" --> M{"Recorded folder exists?"}
+    M -- "no" --> N["Shell waits for the folder<br/>24 h at most, ctrl+c skips"]
+    N -- "folder appeared" --> M
+    N -- "skipped or 24 h passed" --> O["No resume, record kept<br/>never another folder"]
+    M -- "yes" --> J["Wait for this tab's turn"]
     J --> K["Print the resume command, start the watcher"]
 ```
 
@@ -101,6 +105,50 @@ Now:
 
 - When a session is recorded for a terminal, records of the same session whose agent is not running are removed.
 - At resume time, a terminal steps back when the same session runs elsewhere or another live terminal has a later record for it.
+
+## A folder that is not there yet
+
+A recorded folder can be missing when the tabs come back: an external drive that is not plugged in, a network share, or an encrypted volume that is only unlocked some time after login. On the fourth real reboot the tabs were back two minutes after login and the drive with their folders was mounted hours later.
+
+The first versions of the tool dropped the `cd` when the folder was missing and started the agent anyway, in whatever folder the recovered shell had. That was wrong twice over:
+
+- The agent worked in the wrong folder (the home folder), with the wrong project settings and files. Codex stopped at a question about which folder to use.
+- The hook of the resumed agent then recorded that folder as the session's folder. After the next reboot the session would start in the wrong place again, with nothing left to show where it belonged.
+
+Now a missing folder never leads to a start somewhere else:
+
+1. `check` prints the folder and exits with code 3. The record is not marked as used.
+2. The shell shows `hc-claude-resume: waiting for the session's folder <folder> (ctrl+c skips)` and runs `hc-claude-resume wait-folder`, which looks every 2 s for up to 24 hours.
+3. When the folder exists, `check` runs again and the tab goes through the normal start queue.
+4. After ctrl+c or 24 hours the tab is a normal shell with the line `agent not resumed, folder missing: <folder>`. The record is untouched. Once the folder is there, resume by hand in that tab:
+
+```
+eval "$(hc-claude-resume check)"
+```
+
+```mermaid
+sequenceDiagram
+    participant SH as Recovered shell
+    participant T as hc-claude-resume
+    participant D as Drive with the folder
+    SH->>T: check
+    T-->>SH: exit 3, the folder that is missing
+    Note over SH: prompt shows the waiting line, ctrl+c skips
+    SH->>T: wait-folder
+    loop every 2 s, 24 h at most
+        T->>D: does the folder exist?
+        D-->>T: not yet
+    end
+    D-->>T: mounted, the folder exists
+    T-->>SH: exit 0
+    SH->>T: check
+    T-->>SH: resume command with cd into the folder
+    Note over SH: the agent starts in its own folder
+```
+
+A missing account launcher still wins over a missing folder: without the launcher there is nothing to wait for, and the tab stays a shell.
+
+If a session did start in the wrong folder (an older copy of the tool, or a resume typed by hand), the record now points there. Quit the agent, `cd` to the right folder and resume the session from there with the same launcher; the hook records the right folder again. For a tab you cannot type in, see [troubleshooting](troubleshooting.md).
 
 ## Starts take turns, and missed probes are repaired
 
@@ -169,6 +217,8 @@ Knobs, all constants at the top of the script:
 | `RESTART_QUIET_S` | 30 | No agent start for this long before a restart |
 | `RESTART_CONTENTION_MAX` | 1.5 | Highest contention factor that counts as quiet |
 | `RESTART_WAIT_MAX_S` | 600 | Longest wait for a quiet machine |
+| `FOLDER_WAIT_MAX_S` | 86400 | Longest wait for a recorded folder that does not exist |
+| `FOLDER_WAIT_EVERY_S` | 2 | Seconds between two looks for that folder |
 
 Switches, empty files in `~/.local/state/hc-claude-resume/<core>/`:
 
@@ -177,13 +227,16 @@ Switches, empty files in `~/.local/state/hc-claude-resume/<core>/`:
 
 ## What you will notice
 
-- Agent tabs come back one after another. Twelve tabs took about 35 s on a calm machine and longer under load.
+- Agent tabs come back one after another. Twelve tabs took about 35 s on a calm machine and longer under load. On a real reboot with 26 agent tabs the last one was held for 93 s.
+- A tab whose folder is on a drive that is not mounted yet shows the waiting line and resumes by itself when the drive appears.
 - A tab may restart itself once in the first minutes after a reboot. The session is the same; the scrollback above it stays.
-- `events.log` tells the story of each tab: `start held`, `recorded`, `status check`, `not resumed`.
+- `events.log` tells the story of each tab: `start held`, `recorded`, `status check`, `not resumed`, `not resumed yet: ... folder missing`, `folder is back after Ns`.
 
 ## Limits
 
 - macOS and zsh only were tested. On Linux the boot time lookup returns nothing, so only the "terminal program changed" rule applies.
 - The idle check reads the screen for Claude Code's prompt character and the words "esc to interrupt". A redesign of that screen breaks the check; the watcher then does nothing, which is the safe side.
-- Verified by simulated reboots in a separate core and by two real reboots of the earlier, simpler version. The queue and the watcher have not gone through a real reboot yet. See [observed results](observed-results.md).
+- The queue and the same-session rule went through one real reboot: 26 starts, every Claude Code tab reported a status, so the watcher had nothing to restart. The watcher's restart and the wait for a missing folder were only verified in a separate core. See [observed results](observed-results.md).
+- The folder wait only knows "the folder exists". A folder that exists but is the wrong one (an old copy of a moved workspace, an empty mount point) is not noticed.
+- The waiting shell holds its prompt. Typing in that tab needs ctrl+c first.
 - Only a short list of on/off flags is carried over to the resume command (`RESUME_FLAGS` in the script), never a flag that takes a value. With an account launcher no flag is carried over: the launcher adds its own.

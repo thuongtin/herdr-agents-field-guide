@@ -6,7 +6,7 @@ Field notes from running many coding agents (Claude Code, Codex, Grok) in the ta
 
 The repository holds **documentation, one small tool (`hc-claude-resume`) and scripts to reproduce the problems**. It is not an official product and is not affiliated with the makers of Herdr, Claude Code, Codex or Grok.
 
-**Observed between 2026-11-12 and 2026-11-18** on one macOS machine. The versions below are the ones tested, not necessarily the latest. The numbers are a summary by the author from real runs; the raw logs are private and are not published. Reproduce them yourself instead of treating the tables as evidence you can audit.
+**Observed between 2026-11-12 and 2026-11-20** on one macOS machine. The versions below are the ones tested, not necessarily the latest. The numbers are a summary by the author from real runs; the raw logs are private and are not published. Reproduce them yourself instead of treating the tables as evidence you can audit.
 
 ## What happened
 
@@ -15,6 +15,7 @@ The repository holds **documentation, one small tool (`hc-claude-resume`) and sc
 | First | Tabs, names and folders were intact, but every agent was gone: the tabs were plain shells. Typing the usual "continue" command signed in with the wrong account | herdr-core recovers a terminal as a shell and does not run the old command again |
 | Second | Claude Code came back on the right accounts. Codex and Grok did not. Some tabs said "Not logged in" | The core had been started from an ssh connection and could not read the Keychain |
 | Third | Every agent came back, but 9 of 14 Claude Code tabs were missing from the Agents list | Claude Code asks the terminal once at startup and waits about 2 seconds. With about 30 agents starting together it read the answer too late, and it never asks again |
+| Fourth | Every agent came back in turn and every Claude Code tab reported a status. But 6 tabs started without their project folder: 4 in the home folder, 2 stuck at a question about the folder | The folders were on an encrypted external drive that was mounted long after the tabs came back. The tool dropped the missing folder and started the agent anyway. It now waits for the folder |
 
 The path of one tab after a reboot, with the tool of this repository:
 
@@ -23,7 +24,10 @@ flowchart TD
     A["Reboot, logout or core crash"] --> B["herdr-core recovers each terminal<br/>as a bare shell"]
     B --> C{"Record for this tab?"}
     C -- "no" --> S["Tab stays a shell"]
-    C -- "yes" --> D["Agent starts take turns"]
+    C -- "yes" --> K{"Is the session's folder there?"}
+    K -- "no, drive not mounted yet" --> W["Tab waits for the folder<br/>never starts somewhere else"]
+    W --> K
+    K -- "yes" --> D["Agent starts take turns"]
     D --> E["Same session, same account"]
     E --> F{"Does the agent report a status?"}
     F -- "yes" --> G["Listed under Agents"]
@@ -43,6 +47,7 @@ flowchart TD
 7. **Codex in its shared background server cannot be tied to a tab.** `codex --no-daemon` can. New Codex hooks need your own review. See [Codex and Grok](docs/codex-and-grok.md).
 8. **Reproduce before you conclude.** Every experiment ran in a separate core (`HC_SESSION=<name>`) with copies of sessions, never in the real tabs. See [Reproduce](docs/reproduce.md).
 9. **One Claude account per tab means every command goes through that account's launcher.** Transcripts are shared, so any account can continue any session and nothing warns you. The `claude --resume <id>` line that Claude Code prints at exit moves the session to the default account. See [One account per tab](docs/claude-accounts.md).
+10. **A missing folder is a reason to wait, never to start somewhere else.** After a reboot a drive can show up minutes or hours later than the tabs. An agent started in another folder works on the wrong files, and its own hook then records that folder as the session's, so the mistake survives the next reboot. And after moving a workspace, rename the old copy: while it exists, every stale path keeps working, on the old files. See [Resume after a reboot](docs/resume-after-reboot.md) and [Troubleshooting](docs/troubleshooting.md).
 
 ## Contents
 
@@ -105,15 +110,15 @@ python3 -m unittest discover -s tests -v
 | Component | Version |
 |---|---|
 | herdr-core (`hc`) | 0.1.21 |
-| Claude Code | 2.1.326, 2.1.327 |
-| Codex CLI | 0.169.1 |
+| Claude Code | 2.1.326, 2.1.327; 2.1.329 for the folder repair |
+| Codex CLI | 0.169.1; 0.170.0 for the folder repair |
 | Grok | 1.0.88 |
 | OS, shell | macOS 27.0.1, zsh 5.9 |
 | Python | 3.14 (the script also parses on 3.9) |
 
 ## Limits
 
-- The start queue and the watcher went through **simulated reboots** in a separate core only, **not through a real reboot yet**.
+- The start queue went through one real reboot (26 agent tabs, every Claude Code tab reported a status). The watcher's restart and the wait for a missing folder went through **simulated reboots** in a separate core only, **not through a real reboot yet**.
 - Each variant ran once or twice. The numbers show that spacing is not enough; they do not give a failure rate.
 - The 2 s deadline and the single probe are behavior observed in the two Claude Code versions above. They are not documented and can change in any release.
 - A fresh session (not a resumed one) can still lose its status when it starts on a loaded machine. The tool only watches tabs it resumed.

@@ -17,7 +17,13 @@ and a manual `claude -c` there signs in with the default account.
   hc-claude-resume check  Run by ~/.zshrc at the first prompt of a shell. Prints the
                           command that resumes the recorded session, only when the
                           terminal's program was replaced since the session was recorded
-                          (= the terminal was lost).
+                          (= the terminal was lost). When the session's folder does not
+                          exist (a drive that is not mounted yet), it prints the folder
+                          and exits 3: the session is never started in another folder.
+  hc-claude-resume wait-folder
+                          Run by ~/.zshrc after `check` exited 3. Returns when the folder
+                          is there or the record changed (exit 0: run `check` again), or
+                          after FOLDER_WAIT_MAX_S (exit 1).
   hc-claude-resume seed   Record the Claude sessions that are running right now (for
                           sessions started before the hook was installed).
   hc-claude-resume set <terminal> <agent> <session-id> [folder]
@@ -87,6 +93,11 @@ REAP_DELAY_S = 25
 START_GAP_S = 2.0
 START_SETTLE_MAX_S = 20
 START_WAIT_MAX_S = 300
+# A recorded folder that does not exist at resume time is usually on a drive that is
+# not mounted yet (an encrypted external drive is unlocked long after login). The shell
+# waits for it this long, looking this often.
+FOLDER_WAIT_MAX_S = 86400
+FOLDER_WAIT_EVERY_S = 2
 # Watching a resumed agent: first look, interval, and when to stop looking.
 STATUS_CHECK_FIRST_S = 15
 STATUS_CHECK_EVERY_S = 5
@@ -489,6 +500,12 @@ def cmd_set(args):
     return 0
 
 
+def missing_folder(entry):
+    """The recorded folder when it does not exist now, else an empty string."""
+    cwd = str(entry.get("cwd") or "")
+    return cwd if cwd and not os.path.isdir(cwd) else ""
+
+
 def resume_command(entry):
     agent = entry_agent(entry)
     if not agent:
@@ -511,9 +528,13 @@ def resume_command(entry):
         parts = ["grok"] + flags + ["--resume", session_id]
     if not shutil.which(parts[0]):
         return None
+    if missing_folder(entry):
+        # Never start the session in whatever folder the shell is in: the agent would
+        # work on the wrong files and record that folder as the session's own.
+        return None
     cwd = entry.get("cwd")
     cmd = " ".join(shlex.quote(p) for p in parts)
-    if cwd and os.path.isdir(cwd):
+    if cwd:
         cmd = f"cd -- {shlex.quote(cwd)} && {cmd}"
     return cmd
 
@@ -773,6 +794,14 @@ def cmd_check():
             log_event(f"{terminal} not resumed: session={entry['session_id']} agent={agent} "
                       f"{'runs in' if live else 'has a later record for'} {other_terminal}; record removed")
             return 1
+    folder = missing_folder(entry)
+    if folder and resume_command(dict(entry, cwd="")):
+        # Only the folder is missing. Tell the shell, which waits (`wait-folder`) and
+        # asks again; the record stays as it is.
+        log_event(f"{terminal} not resumed yet: session={entry['session_id']} agent={agent} "
+                  f"folder missing: {folder}")
+        print(folder)
+        return 3
     cmd = resume_command(entry)
     if not cmd:
         return 1
@@ -784,6 +813,34 @@ def cmd_check():
     start_status_check(terminal, program_pid)
     print(cmd)
     return 0
+
+
+def cmd_wait_folder():
+    """Wait until the recorded folder of this terminal exists.
+
+    Exit 0 means "run `check` again": the folder is there, or the record changed or
+    is gone and `check` decides. Exit 1: still missing after FOLDER_WAIT_MAX_S.
+    """
+    terminal = os.environ.get("HC_TERMINAL_ID")
+    if not terminal:
+        return 0
+    began = time.time()
+    first = None
+    while True:
+        entry = read_json(entry_path(terminal))
+        folder = missing_folder(entry) if entry else ""
+        if first is None:
+            first = folder
+        waited = int(time.time() - began)
+        if not folder:
+            if first:
+                what = "folder is back" if os.path.isdir(first) else "record changed while waiting for"
+                log_event(f"{terminal} {what} after {waited}s: {first}")
+            return 0
+        if waited >= FOLDER_WAIT_MAX_S:
+            log_event(f"{terminal} not resumed: folder still missing after {waited}s: {folder}")
+            return 1
+        time.sleep(FOLDER_WAIT_EVERY_S)
 
 
 def cmd_list():
@@ -814,6 +871,11 @@ def main():
             return 0  # a hook must never get in the agent's way
     if cmd == "check":
         return cmd_check()
+    if cmd == "wait-folder":
+        try:
+            return cmd_wait_folder()
+        except KeyboardInterrupt:
+            return 130
     if cmd == "reap":
         try:
             return cmd_reap(sys.argv[2:])

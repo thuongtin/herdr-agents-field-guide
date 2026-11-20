@@ -2,7 +2,7 @@
 
 [Guide](../README.en.md)
 
-Everything here was seen on one machine by one person between 2026-11-12 and 2026-11-18. The raw logs are private and are not in this repository, so these tables are a summary you cannot audit. Use [reproduce](reproduce.md) to get your own numbers.
+Everything here was seen on one machine by one person between 2026-11-12 and 2026-11-20. The raw logs are private and are not in this repository, so these tables are a summary you cannot audit. Use [reproduce](reproduce.md) to get your own numbers.
 
 ## Setup
 
@@ -10,7 +10,7 @@ Everything here was seen on one machine by one person between 2026-11-12 and 202
 |---|---|
 | Machine | Laptop, 14 CPU cores, macOS 27.0.1 |
 | Multiplexer | herdr-core (`hc` 0.1.21) with the Herdr app |
-| Agents | Claude Code 2.1.326 and 2.1.327, codex-cli 0.169.1, grok 1.0.88 |
+| Agents | Claude Code 2.1.326 and 2.1.327, codex-cli 0.169.1, grok 1.0.88. The versions at the fourth reboot were not noted; the day after, the machine had Claude Code 2.1.329, codex-cli 0.170.0 and grok 1.0.89 |
 | Shell | zsh 5.9. The tool ran on Python 3.14; it also parses on 3.9 |
 | Test folder | One folder with about 184,000 files. Each session's file index at start is the main CPU load |
 | Test sessions | Copies of real transcripts under new ids, started idle, no prompt sent |
@@ -23,7 +23,9 @@ Everything here was seen on one machine by one person between 2026-11-12 and 202
 | 2026-11-16 | Resume for Claude Code | Claude Code tabs, each with its recorded account | Codex and Grok tabs (not covered yet). Default-account tabs said "Not logged in": the core was born in an ssh session, see [core environment](core-environment.md) |
 | 2026-11-18 | Resume for all three agents, no queue | All recorded tabs resumed | 9 of 14 Claude Code tabs had no status and were missing from the Agents list. About 30 agents started in the same seconds. One session opened in two tabs |
 
-The queue, the watcher and the same-session rule were written after the third reboot. **They have not been through a real reboot yet.**
+| 2026-11-19 | Queue, watcher, same-session rule | 26 agent tabs resumed through the queue, the last one held for 93 s. All 15 Claude Code tabs reported a status at the first look, no restart was needed. One session recorded for two tabs was resumed in one tab only | 4 Claude Code tabs started in the home folder and 2 Codex tabs stopped at a question about the folder. Their folders were on an encrypted external drive that was mounted hours after the tabs came back, and the tool dropped the missing folder from the resume command |
+
+The queue, the watcher and the same-session rule were written after the third reboot. The queue and the same-session rule held in the fourth. The watcher's restart had nothing to do there, and the wait for a missing folder was written after it: **these two have not been through a real reboot yet.**
 
 ```mermaid
 flowchart TD
@@ -32,7 +34,9 @@ flowchart TD
     R2 --> T2["Core started in the GUI login<br/>resume for Codex and Grok"]
     T2 --> R3["Reboot 3<br/>all recorded tabs resumed<br/>9 of 14 without status"]
     R3 --> T3["Queue, watcher, same-session rule"]
-    T3 --> R4["Reboot 4: has not happened yet"]
+    T3 --> R4["Reboot 4<br/>26 tabs resumed in turn, every Claude Code tab with a status<br/>6 tabs without their folder: the drive was not mounted yet"]
+    R4 --> T4["A missing folder means wait, never start elsewhere"]
+    T4 --> R5["Reboot 5: has not happened yet"]
 ```
 
 ## Simulated reboots, 12 sessions
@@ -59,7 +63,8 @@ flowchart TD
     B --> C["One start at a time<br/>0 of 12 on a calm run, 4 of 13 starts missed under heavy load"]
     C --> D["Queue plus watcher, restart right away<br/>11 of 12, then 12 of 12 after the restart"]
     D --> E["Queue plus watcher plus quiet-machine wait<br/>12 of 12 at the first try, one run"]
-    E --> F["Still open: a real reboot with this version"]
+    E --> F["Real reboot with this version<br/>15 of 15 Claude Code tabs with a status, nothing to repair"]
+    F --> G["Still open: a real reboot where the watcher has to restart a tab"]
 ```
 
 ## Where the time goes
@@ -71,6 +76,7 @@ flowchart TD
 | Same, in the seconds around a missed probe | 5 to 20 |
 | Time for one agent to come up when about 30 start together | 5 to 20 s |
 | Time until 12 tabs are all resumed through the queue, calm machine | About 35 s |
+| Longest hold of one start in the queue, real reboot with 26 agent tabs | 93 s |
 
 Load average did not line up with the misses. It moves too slowly to show a burst of a few seconds; the busy loop does.
 
@@ -97,9 +103,32 @@ With the test switch that makes a session report no status ([reproduce](reproduc
 
 A bug found by this test: the first version of the retry counter emptied its file before reading it, so the count never passed 1 and a tab that always missed was restarted past the limit of 2. The counter is now read before the file is opened for writing.
 
+## Missing folder
+
+Separate core, a stand-in launcher instead of a real agent, a record whose folder did not exist:
+
+| Case | Result |
+|---|---|
+| Shell lost, folder missing | The prompt showed the waiting line, nothing was started, the record was not marked as used |
+| Folder created while the tab waited | The tab resumed by itself, in the recorded folder |
+| ctrl+c while waiting | A working shell with the line `agent not resumed, folder missing`, record untouched |
+| `eval "$(hc-claude-resume check)"` typed later, folder present | The session resumed in the recorded folder |
+
+On the real machine, the six tabs of the fourth reboot were repaired by pointing each record at the right folder and killing the tab's program while the agent was idle. All six came back in the right folder; one Codex tab then asked its user to trust the new folder.
+
+```mermaid
+flowchart LR
+    A["Record with a folder on a drive<br/>that is not mounted"] --> B{"Tool version"}
+    B -- "before the fix" --> C["Agent started in the shell's folder<br/>hook recorded that folder for the session"]
+    B -- "now" --> D["Tab waits, record untouched"]
+    D --> E["Drive mounted: resume in the recorded folder"]
+    D --> F["ctrl+c: plain shell, resume by hand later"]
+```
+
 ## Not tested
 
-- A real reboot with the current version.
+- A real reboot with the folder wait, and a real reboot in which the watcher has to restart a tab.
+- A wait of hours for a folder. The longest wait tried was under a minute; the 24 hour limit was only run against a fake clock in the tests.
 - Linux, bash, fish, other terminals or multiplexers.
 - Other versions of the agents. The 2 s deadline and the single probe can change in any release.
 - Fresh sessions that miss their probe (the watcher only follows resumed tabs).

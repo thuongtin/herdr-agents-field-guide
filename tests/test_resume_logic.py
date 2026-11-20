@@ -142,9 +142,15 @@ class ResumeCommandTests(Base):
         cmd = self.m.resume_command({"agent": "claude", "session_id": SESSION_A, "cwd": folder})
         self.assertEqual(cmd, f"cd -- '{folder}' && claude --resume {SESSION_A}")
 
-    def test_missing_folder_is_skipped(self):
+    def test_missing_folder_means_no_command(self):
+        # Never "claude --resume" without the cd: that starts the session in the
+        # shell's folder (seen with an external drive that was mounted after login).
         cmd = self.m.resume_command({"agent": "claude", "session_id": SESSION_A,
                                      "cwd": os.path.join(self.tmp.name, "gone")})
+        self.assertIsNone(cmd)
+
+    def test_record_without_folder_has_no_cd(self):
+        cmd = self.m.resume_command({"agent": "claude", "session_id": SESSION_A, "cwd": ""})
         self.assertEqual(cmd, f"claude --resume {SESSION_A}")
 
 
@@ -480,6 +486,95 @@ class CheckTests(Base):
         self.entry("t2", program_pid=100, recorded_at=now)
         del self.terms["t2"]
         self.assertEqual(self.check()[0], 0)
+
+    def log(self):
+        try:
+            return Path(self.m.state_dir(), "events.log").read_text()
+        except FileNotFoundError:
+            return ""
+
+    def test_missing_folder_is_reported_and_nothing_is_used_up(self):
+        folder = os.path.join(self.tmp.name, "drive", "project")
+        self.entry("t1", program_pid=100, cwd=folder)
+        self.assertEqual(self.check(), (3, folder))
+        self.assertEqual(self.watched, [])
+        self.assertNotIn("consumed_by", self.m.read_json(self.m.entry_path("t1")))
+        self.assertIn(f"folder missing: {folder}", self.log())
+        # The drive is mounted: the same shell asks again and gets the full command.
+        os.makedirs(folder)
+        self.assertEqual(self.check(), (0, f"cd -- {folder} && claude --resume {SESSION_A}"))
+        self.assertEqual(self.watched, [("t1", 900)])
+
+    def test_missing_launcher_wins_over_missing_folder(self):
+        self.entry("t1", program_pid=100, account="work",
+                   cwd=os.path.join(self.tmp.name, "gone"))
+        self.patch("shutil", mock.Mock(which=lambda name: None))
+        self.assertEqual(self.check(), (1, ""))
+
+
+class WaitFolderTests(Base):
+    """cmd_wait_folder with a fake clock."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["HC_TERMINAL_ID"] = "t1"
+        self.folder = os.path.join(self.tmp.name, "drive", "project")
+        self.clock = [1000.0]
+        self.on_sleep = lambda: None
+        fake_time = mock.Mock(wraps=time)
+        fake_time.time = lambda: self.clock[0]
+
+        def sleep(seconds):
+            self.clock[0] += seconds
+            self.on_sleep()
+
+        fake_time.sleep = sleep
+        self.patch("time", fake_time)
+
+    def log(self):
+        try:
+            return Path(self.m.state_dir(), "events.log").read_text()
+        except FileNotFoundError:
+            return ""
+
+    def test_folder_already_there(self):
+        os.makedirs(self.folder)
+        self.entry("t1", cwd=self.folder)
+        self.assertEqual(self.m.cmd_wait_folder(), 0)
+        self.assertEqual(self.log(), "")
+
+    def test_returns_when_the_folder_appears(self):
+        self.entry("t1", cwd=self.folder)
+
+        def mount():
+            if self.clock[0] >= 1010:
+                os.makedirs(self.folder, exist_ok=True)
+
+        self.on_sleep = mount
+        self.assertEqual(self.m.cmd_wait_folder(), 0)
+        self.assertIn(f"t1 folder is back after 10s: {self.folder}", self.log())
+
+    def test_gives_up_after_the_limit(self):
+        self.entry("t1", cwd=self.folder)
+        self.assertEqual(self.m.cmd_wait_folder(), 1)
+        self.assertGreaterEqual(self.clock[0] - 1000, self.m.FOLDER_WAIT_MAX_S)
+        self.assertIn("not resumed: folder still missing", self.log())
+
+    def test_record_removed_meanwhile(self):
+        self.entry("t1", cwd=self.folder)
+        self.on_sleep = lambda: self.m.remove(self.m.entry_path("t1"))
+        self.assertEqual(self.m.cmd_wait_folder(), 0)
+
+    def test_record_pointed_at_another_folder_meanwhile(self):
+        self.entry("t1", cwd=self.folder)
+        other = os.path.join(self.tmp.name, "moved")
+        os.makedirs(other)
+        self.on_sleep = lambda: self.entry("t1", cwd=other)
+        self.assertEqual(self.m.cmd_wait_folder(), 0)
+
+    def test_no_terminal(self):
+        del os.environ["HC_TERMINAL_ID"]
+        self.assertEqual(self.m.cmd_wait_folder(), 0)
 
 
 class SmallThingsTests(Base):

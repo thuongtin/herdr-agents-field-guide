@@ -15,7 +15,9 @@ flowchart TD
     B -- "no" --> B1["Hooks missing or not reviewed, plain codex,<br/>or the agent was quit before the reboot"]
     B -- "yes" --> C{"Launcher of that account installed?"}
     C -- "no" --> C1["Install the launcher<br/>the tool never uses another account"]
-    C -- "yes" --> C2["Check the zshrc trigger and<br/>the terminal's foreground process"]
+    C -- "yes" --> F{"Recorded folder exists?"}
+    F -- "no" --> F1["Mount or unlock its drive<br/>the tab waits and resumes by itself"]
+    F -- "yes" --> C2["Check the zshrc trigger and<br/>the terminal's foreground process"]
     A -- "yes" --> D{"Listed under Agents?"}
     D -- "no" --> D1["status null: missed probe<br/>wait for the watcher, then restart by hand"]
     D -- "yes" --> E{"Anything odd inside the agent?"}
@@ -30,6 +32,8 @@ flowchart TD
 | Tabs are back, but they are plain shells | `hc-claude-resume list` and `events.log` | No record: the hooks were not installed, not trusted yet (Codex), or the agent was quit before the reboot (`prompt_input_exit` in the log, expected). See [resume](resume-after-reboot.md) |
 | A record exists, the tab is still a shell | The `~/.zshrc` trigger and the foreground process of the terminal | Trigger missing or placed before the prompt theme; a plugin wraps the shell. See [shell pitfalls](shell-pitfalls.md) |
 | Claude Code tab stays a shell, log is silent | `command -v claude-<label>` | The account launcher is missing. The tool never falls back to another account |
+| A tab shows `waiting for the session's folder ...` | Whether that folder exists; is its drive mounted and unlocked? | The recorded folder is missing, so nothing was started. Mount the drive and the tab resumes by itself. ctrl+c gives you the shell; later `eval "$(hc-claude-resume check)"` in that tab resumes it. See [resume after a reboot](resume-after-reboot.md) |
+| An agent came back in the home folder instead of its project, or Codex asks which folder to use | The record's `cwd` in `hc-claude-resume list`, and when the project's drive was mounted | An older copy of the tool started the agent although its folder was missing, and the session then recorded the wrong folder. Update the tool and the `~/.zshrc` trigger, then quit the agent, `cd` to the right folder and resume the session there |
 | Agent runs, but is missing from the Agents list | `hc get <terminal> --json`: `status: null`, agent in `foreground` | Missed status probe. See [root cause](missing-agents-root-cause.md). Wait a few minutes for the watcher, then look for `giving up` in the log |
 | Agent died with "No deferred tool marker found in the resumed session" | Where the resume command is run from | It ran without a terminal (startup code or `precmd` under an instant prompt). Use the `zle-line-init` trigger |
 | "Not logged in", status line without account | `ps` for a `herdr-core serve` under an ssh session; the Keychain exit code | The core was born in an ssh session. See [core environment](core-environment.md) |
@@ -88,6 +92,27 @@ flowchart TD
 Never use `exit` in the tab's shell or `hc kill` for this. Both end the terminal for good and the tab is gone.
 
 An agent that works for you should ask before doing this to a tab you are using, and must not do it to the tab it is running in without a plan for what happens to its own turn.
+
+## After moving a project folder or a whole workspace
+
+A session is tied to its folder in more places than the folder itself. What was found after a workspace moved to another drive, on Claude Code 2.1.329 and codex-cli 0.170.0. None of these stores is a documented format: quit the agent and make a backup before you edit one.
+
+| Where | What holds the folder | What worked |
+|---|---|---|
+| Resume record `<terminal>.json` | `cwd` | The hook writes the new folder as soon as the session runs there. For a tab you cannot type in: set `cwd` in the record, then restart the tab's program as described above |
+| Claude Code transcripts | The name of the session's folder under `~/.claude/projects/` is the project path with every character that is not a letter or a digit replaced by `-` | Move the transcripts to the folder named after the new path, then resume from the new project folder |
+| Codex | A `cwd` column in its state database and `cwd` fields inside the session files | A session resumed from a folder that is not its own stops and asks which folder to use, and offers the old path. After both places were updated the session resumed in the new folder without the question. Codex asks once whether you trust the new folder: answer that yourself |
+| Python virtual environments | Absolute paths in `pyvenv.cfg`, in the first lines of the scripts in `bin/` and in editable installs | Recreate the environment, or rewrite the old path in those text files |
+| The old copy | Nothing, and that is the problem | While the old folder still exists, every stale reference keeps working without a word, on the old files. Rename the old folder once you trust the new one, so that what is left fails loudly |
+
+```mermaid
+flowchart TD
+    A["Workspace moved to a new path"] --> B["Stale path in a record, a session store or a venv"]
+    B --> C{"Does the old folder still exist?"}
+    C -- "yes" --> D["Everything seems to work<br/>but on the old copy"]
+    C -- "no, drive not mounted" --> E["Old tool: agent started in the shell's folder<br/>Now: the tab waits for the folder"]
+    C -- "no, renamed on purpose" --> F["Stale references fail at once<br/>and can be fixed one by one"]
+```
 
 ## Turning parts off
 
